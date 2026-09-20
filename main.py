@@ -562,12 +562,13 @@ class SoupaiPlugin(Star):
         )
 
         self.jev_api_key = str(self.config.get("jev_api_key", "")).strip()
+        # 面板上清空输入框存进来的是空串而不是缺键，默认值得靠 or 兜住，
+        # 不能只依赖 .get 的第二参数——否则 model="" 的请求必然报错
         self.jev_base_url = (
-            str(self.config.get("jev_base_url", "https://api.typesafe.ai"))
-            .strip()
-            .rstrip("/")
+            str(self.config.get("jev_base_url", "")).strip().rstrip("/")
+            or "https://api.typesafe.ai"
         )
-        self.jev_model = str(self.config.get("jev_model", "jev-latest")).strip()
+        self.jev_model = str(self.config.get("jev_model", "")).strip() or "jev-latest"
         self.jev_judge_min_confidence = float(
             self.config.get("jev_judge_min_confidence", 0.5)
         )
