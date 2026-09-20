@@ -628,6 +628,9 @@ class SoupaiPlugin(Star):
         """
         self.generate_llm_provider_id = self.config.get("generate_llm_provider", "")
         self.judge_llm_provider_id = self.config.get("judge_llm_provider", "")
+        self.verify_llm_provider_id = str(
+            self.config.get("verify_llm_provider") or ""
+        ).strip()
         self.hint_llm_provider_id = str(
             self.config.get("hint_llm_provider") or ""
         ).strip()
@@ -1152,10 +1155,11 @@ class SoupaiPlugin(Star):
         Returns:
             VerificationResult: 验证结果
         """
-        provider = self._resolve_provider(self.judge_llm_provider_id, umo)
+        provider_id = self.verify_llm_provider_id or self.judge_llm_provider_id
+        provider = self._resolve_provider(provider_id, umo)
         if provider is None:
-            if self.judge_llm_provider_id:
-                return VerificationResult("验证失败", "未配置判断 LLM，无法验证")
+            if provider_id:
+                return VerificationResult("验证失败", "未配置验证 LLM，无法验证")
             return VerificationResult("验证失败", "未配置 LLM，无法验证")
 
         # 构建验证提示词
@@ -2538,6 +2542,7 @@ class SoupaiPlugin(Star):
             f"⚙️ 海龟汤插件配置：\n"
             f"• 生成谜题 LLM：{self.generate_llm_provider_id or '默认'}\n"
             f"• 判断问答 LLM：{self.judge_llm_provider_id or '默认'}\n"
+            f"• 验证答案 LLM：{self.verify_llm_provider_id or '跟随判断问答 LLM'}\n"
             f"• 生成提示 LLM：{self.hint_llm_provider_id or '跟随判断问答 LLM'}\n"
             f"• 游戏超时：{self.game_timeout} 秒\n"
             f"• 网络题库：{online_info['total']} 个谜题 (已用: {online_info['used']}, 剩余: {online_info['available']})\n"

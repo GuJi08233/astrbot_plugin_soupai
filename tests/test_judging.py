@@ -79,6 +79,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
             "jev_judge_min_confidence": 0.5,
             "judge_llm_provider": "judge",
             "hint_llm_provider": "hint",
+            "verify_llm_provider": "verify",
         }
         self.plugin._load_config()
         self.judge_provider = SimpleNamespace(
@@ -89,12 +90,23 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(completion_text="关注【时间】：比较先后")
             )
         )
+        self.verify_provider = SimpleNamespace(
+            text_chat=AsyncMock(
+                return_value=SimpleNamespace(
+                    completion_text="等级：完全还原\n评价：推理正确"
+                )
+            )
+        )
         self.default_provider = SimpleNamespace(
             text_chat=AsyncMock(
                 return_value=SimpleNamespace(completion_text="默认提示")
             )
         )
-        self.providers = {"judge": self.judge_provider, "hint": self.hint_provider}
+        self.providers = {
+            "judge": self.judge_provider,
+            "hint": self.hint_provider,
+            "verify": self.verify_provider,
+        }
         self.plugin.context = SimpleNamespace(
             get_provider_by_id=Mock(side_effect=self.providers.get),
             get_using_provider=Mock(return_value=self.default_provider),
@@ -212,6 +224,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source["jev"]["probabilities"], self.answer["probabilities"])
         self.judge_provider.text_chat.assert_awaited_once()
         self.hint_provider.text_chat.assert_not_awaited()
+        self.verify_provider.text_chat.assert_not_awaited()
 
     async def test_confidence_equal_to_threshold_is_accepted(self):
         self.answer["confidence"] = 0.5
@@ -409,6 +422,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.client_factory.assert_not_called()
         self.judge_provider.text_chat.assert_awaited_once()
         self.hint_provider.text_chat.assert_not_awaited()
+        self.verify_provider.text_chat.assert_not_awaited()
 
     async def test_hints_use_only_the_hint_provider(self):
         hint = await self.plugin.generate_hint(
@@ -419,6 +433,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context.get_provider_by_id.assert_called_once_with("hint")
         self.hint_provider.text_chat.assert_awaited_once()
         self.judge_provider.text_chat.assert_not_awaited()
+        self.verify_provider.text_chat.assert_not_awaited()
         self.client_factory.assert_not_called()
 
     async def test_missing_explicit_hint_provider_does_not_use_judge(self):
@@ -468,7 +483,9 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context.get_provider_by_id.assert_not_called()
         self.default_provider.text_chat.assert_awaited_once()
 
-    async def test_verification_still_uses_judge_provider(self):
+    async def test_missing_verify_configuration_follows_judge_provider(self):
+        del self.plugin.config["verify_llm_provider"]
+        self.plugin._load_config()
         self.judge_provider.text_chat.return_value = SimpleNamespace(
             completion_text="等级：完全还原\n评价：推理正确"
         )
@@ -482,6 +499,101 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context.get_provider_by_id.assert_called_once_with("judge")
         self.judge_provider.text_chat.assert_awaited_once()
         self.hint_provider.text_chat.assert_not_awaited()
+        self.verify_provider.text_chat.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
+    async def test_verification_uses_its_own_provider(self):
+        self.plugin.config["verify_llm_provider"] = " verify "
+        self.plugin._load_config()
+
+        result = await self.plugin.verify_user_guess(
+            "Test guess", "Test answer", umo="test-session"
+        )
+
+        self.assertEqual(self.plugin.verify_llm_provider_id, "verify")
+        self.assertTrue(result.is_correct)
+        self.assertEqual(result.level, "完全还原")
+        self.plugin.context.get_provider_by_id.assert_called_once_with("verify")
+        self.verify_provider.text_chat.assert_awaited_once()
+        self.judge_provider.text_chat.assert_not_awaited()
+        self.hint_provider.text_chat.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
+    async def test_blank_verify_provider_follows_judge_provider(self):
+        self.judge_provider.text_chat.return_value = SimpleNamespace(
+            completion_text="等级：完全还原\n评价：推理正确"
+        )
+        for verify_provider in ("", "   ", None):
+            with self.subTest(verify_provider=verify_provider):
+                self.plugin.config["verify_llm_provider"] = verify_provider
+                self.plugin._load_config()
+                self.plugin.context.get_provider_by_id.reset_mock()
+
+                result = await self.plugin.verify_user_guess(
+                    "Test guess", "Test answer", umo="test-session"
+                )
+
+                self.assertTrue(result.is_correct)
+                self.plugin.context.get_provider_by_id.assert_called_once_with("judge")
+        self.verify_provider.text_chat.assert_not_awaited()
+        self.hint_provider.text_chat.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
+    async def test_blank_verify_and_judge_follow_session_provider(self):
+        self.plugin.config["verify_llm_provider"] = ""
+        self.plugin.config["judge_llm_provider"] = ""
+        self.plugin._load_config()
+        self.default_provider.text_chat.return_value = SimpleNamespace(
+            completion_text="等级：完全还原\n评价：推理正确"
+        )
+
+        result = await self.plugin.verify_user_guess(
+            "Test guess", "Test answer", umo="test-session"
+        )
+
+        self.assertTrue(result.is_correct)
+        self.plugin.context.get_using_provider.assert_called_once_with(
+            umo="test-session"
+        )
+        self.plugin.context.get_provider_by_id.assert_not_called()
+        self.default_provider.text_chat.assert_awaited_once()
+        self.judge_provider.text_chat.assert_not_awaited()
+        self.hint_provider.text_chat.assert_not_awaited()
+        self.verify_provider.text_chat.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
+    async def test_missing_explicit_verify_provider_does_not_use_judge(self):
+        del self.providers["verify"]
+
+        result = await self.plugin.verify_user_guess(
+            "Test guess", "Test answer", umo="test-session"
+        )
+
+        self.assertFalse(result.is_correct)
+        self.assertEqual(result.level, "验证失败")
+        self.plugin.context.get_provider_by_id.assert_called_once_with("verify")
+        self.plugin.context.get_using_provider.assert_not_called()
+        self.judge_provider.text_chat.assert_not_awaited()
+        self.hint_provider.text_chat.assert_not_awaited()
+        self.default_provider.text_chat.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
+    async def test_failed_verify_provider_does_not_use_judge(self):
+        self.verify_provider.text_chat.side_effect = RuntimeError(
+            "Synthetic verification failure"
+        )
+
+        result = await self.plugin.verify_user_guess(
+            "Test guess", "Test answer", umo="test-session"
+        )
+
+        self.assertFalse(result.is_correct)
+        self.assertEqual(result.level, "验证失败")
+        self.plugin.context.get_provider_by_id.assert_called_once_with("verify")
+        self.verify_provider.text_chat.assert_awaited_once()
+        self.judge_provider.text_chat.assert_not_awaited()
+        self.hint_provider.text_chat.assert_not_awaited()
+        self.default_provider.text_chat.assert_not_awaited()
         self.client_factory.assert_not_called()
 
 

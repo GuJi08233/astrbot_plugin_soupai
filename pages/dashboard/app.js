@@ -711,7 +711,11 @@
     const isNumeric = meta.type === 'int' || meta.type === 'float';
     if (meta._special === 'select_provider') {
       input = el('select', 'input');
-      input.appendChild(new Option(key === 'hint_llm_provider' ? '（跟随判断问答 LLM）' : '（使用系统默认）', ''));
+      input.appendChild(new Option(
+        ['hint_llm_provider', 'verify_llm_provider'].includes(key)
+          ? '（跟随判断问答 LLM）' : '（使用系统默认）',
+        '',
+      ));
       cfg.providers.forEach((p) => input.appendChild(new Option(providerLabel(p), p.id)));
       input.value = cfg.values[key] || '';
       input.onchange = (e) => setValue(key, e.target.value);

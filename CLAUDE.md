@@ -50,9 +50,13 @@ This is an AstrBot plugin, so development involves:
   rather than calling `get_using_provider` / `get_provider_by_id` directly —
   it centralises the fallback and passes `umo` so per-session provider
   isolation keeps working. `generate_llm_provider` selects the puzzle model;
-  `judge_llm_provider` handles question verdicts and answer verification;
-  `hint_llm_provider` selects the hint model and follows `judge_llm_provider`
-  when empty.
+  `judge_llm_provider` handles only question verdicts and Jev fallback;
+  `verify_llm_provider` selects the full-reasoning verification model;
+  `hint_llm_provider` selects the hint model. Empty verification and hint
+  settings independently follow `judge_llm_provider`; if that is also empty,
+  resolve the current session's model through `umo`. This allows a fast
+  question model and a stronger verification model without changing puzzle
+  generation or hint selection.
 - **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
   config) or `self._safe_send()` (swallows send failures). Do not call
   `event.send(event.plain_result(...))` directly on paths that end a game.
@@ -69,7 +73,7 @@ This is an AstrBot plugin, so development involves:
   classify the same way, or flipping the setting changes how the game feels.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 - **Config schema**: `_conf_schema.json` is rendered by the dashboard's
-  `ConfigItemRenderer`. Three provider fields carry `"_special":
+  `ConfigItemRenderer`. Four provider fields carry `"_special":
   "select_provider"`, which swaps the text box for the same provider dropdown
   the core settings use — it emits the provider `id`, which is exactly the key
   `get_provider_by_id` expects. Enum fields pair `options` with a same-length

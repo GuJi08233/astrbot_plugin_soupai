@@ -7,10 +7,17 @@
     "default": ""
   },
   "judge_llm_provider": {
-    "description": "判断问答和验证答案的 LLM 服务商",
+    "description": "判断问答的 LLM 服务商",
     "type": "string",
     "_special": "select_provider",
-    "hint": "用于问答判定（含 Jev 回退）和 /验证；留空使用当前会话的默认 LLM 服务商。",
+    "hint": "用于是/否等问答判定（含 Jev 回退），适合选择快速模型；留空使用当前会话的默认 LLM 服务商。",
+    "default": ""
+  },
+  "verify_llm_provider": {
+    "description": "验证答案的 LLM 服务商",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "独立选择 /验证 完整推理使用的模型，适合选择推理能力较强的模型；留空跟随判断问答的 LLM 服务商。",
     "default": ""
   },
   "hint_llm_provider": {
