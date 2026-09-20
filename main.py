@@ -23,10 +23,15 @@ from astrbot.core.utils.session_waiter import (
     session_waiter,
 )
 
+from .story_catalog import StoryCatalog
 from .webui import SoupaiWebApi
 
 # 未提供会话标识时归入的记录桶，例如后台任务取题
 DEFAULT_SESSION = "__default__"
+
+
+class DuplicateStoryError(ValueError):
+    """A story collides with an existing puzzle or answer in any bank."""
 
 
 # 线程安全的题库管理基类
@@ -610,6 +615,8 @@ class SoupaiPlugin(Star):
         self.local_story_storage = None
         self.online_story_storage = None
         self.custom_story_storage = None
+        self._story_write_lock = asyncio.Lock()
+        self.story_catalog = StoryCatalog(self)
 
         # 防止重复调用的状态
         self.generating_games = set()  # 正在生成谜题的群聊ID集合
@@ -735,7 +742,7 @@ class SoupaiPlugin(Star):
             logger.error(f"注册网页管理接口失败，网页端将不可用: {e}")
 
         # 启动自动生成任务
-        asyncio.create_task(self._start_auto_generate())
+        self.auto_generate_task = asyncio.create_task(self._start_auto_generate())
 
         online_info = self.online_story_storage.get_storage_info()
         logger.info(
@@ -748,6 +755,14 @@ class SoupaiPlugin(Star):
         self.auto_generating = False
         if self.auto_generate_task:
             self.auto_generate_task.cancel()
+            await asyncio.gather(self.auto_generate_task, return_exceptions=True)
+        for task in (
+            getattr(self, "_generation_loop_task", None),
+            getattr(getattr(self, "web_api", None), "annotation_task", None),
+        ):
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         if self._jev_client is not None:
             await self._jev_client.aclose()
             self._jev_client = None
@@ -776,7 +791,9 @@ class SoupaiPlugin(Star):
 
                         logger.info(f"开始自动生成故事，时间: {current_hour}:00")
                         self.auto_generating = True
-                        asyncio.create_task(self._auto_generate_loop())
+                        self._generation_loop_task = asyncio.create_task(
+                            self._auto_generate_loop()
+                        )
                 else:
                     if self.auto_generating:
                         logger.info(f"停止自动生成故事，时间: {current_hour}:00")
@@ -804,12 +821,8 @@ class SoupaiPlugin(Star):
                     break
 
                 # 生成一个故事
-                puzzle, answer = await self.generate_story_with_llm()
-                if puzzle and answer and not puzzle.startswith("（"):
-                    self.local_story_storage.add_story(puzzle, answer)
-                    logger.info("自动生成故事成功")
-                else:
-                    logger.warning("自动生成故事失败")
+                await self.generate_and_store_story()
+                logger.info("Generated and checked a backup story")
 
                 # 等待5分钟再生成下一个
                 await asyncio.sleep(300)  # 5分钟
@@ -938,16 +951,45 @@ class SoupaiPlugin(Star):
         return provider
 
     # ✅ 生成谜题和答案
-    async def generate_story_with_llm(self, umo: str | None = None) -> tuple[str, str]:
-        """使用 LLM 生成海龟汤谜题"""
+    async def generate_story_with_llm(
+        self,
+        umo: str | None = None,
+        theme: str | None = None,
+        ideas: str | None = None,
+        avoid_stories: list[tuple[str, str]] | None = None,
+    ) -> tuple[str, str]:
+        """Generate a puzzle and answer from optional creative preferences.
+
+        Args:
+            umo: Session origin for model selection.
+            theme: Subject override; empty values use the configured default.
+            ideas: Creative brief; empty values use the configured default.
+            avoid_stories: Rejected attempts whose causal structure must not repeat.
+
+        Returns:
+            The generated puzzle and complete answer.
+
+        Raises:
+            ValueError: Model selection, generation, or output parsing failed.
+        """
 
         provider = self._resolve_provider(self.generate_llm_provider_id, umo)
         if provider is None:
-            if self.generate_llm_provider_id:
-                return "（无法生成题面，指定的生成 LLM 提供商不存在）", "（无）"
-            return "（无法生成题面，请先配置大语言模型）", "（无）"
+            raise ValueError("未配置可用的生成模型，无法生成题目")
 
-        prompt = self._build_puzzle_prompt()
+        prompt = self._build_puzzle_prompt(theme, ideas)
+        if avoid_stories:
+            prompt += (
+                "\n\n【已因重复被拒绝的草稿，仅用于避重】：\n"
+                + json.dumps(
+                    [
+                        {"puzzle": puzzle, "answer": answer}
+                        for puzzle, answer in avoid_stories[-2:]
+                    ],
+                    ensure_ascii=False,
+                )
+                + "\n这些故事已存在于题库。请更换核心因果链和关键反转，不能只改姓名、地点或措辞。"
+            )
 
         try:
             logger.info("开始调用 LLM 生成谜题...")
@@ -1029,13 +1071,28 @@ class SoupaiPlugin(Star):
                 return puzzle, answer
 
             logger.error(f"LLM 返回内容格式错误: {text}")
-            return "生成失败", "无法解析 LLM 返回的内容"
+            raise ValueError("无法解析生成模型返回的汤面和汤底")
+        except ValueError:
+            raise
         except Exception as e:
-            logger.error(f"生成谜题失败: {e}")
-            return "生成失败", f"LLM 调用出错: {e}"
+            logger.error(f"Story generation failed: {e}")
+            raise ValueError("生成模型调用失败，请检查模型配置后重试") from e
 
-    def _build_puzzle_prompt(self) -> str:
-        """构建谜题生成的提示词"""
+    def _build_puzzle_prompt(
+        self, theme: str | None = None, ideas: str | None = None
+    ) -> str:
+        """Build the generation prompt using defaults or per-request choices.
+
+        Args:
+            theme: Optional subject override, or random selection.
+            ideas: Optional creative brief overriding the configured default.
+
+        Returns:
+            Instructions containing the chosen subject and creative brief.
+
+        Raises:
+            ValueError: Preferences exceed the supported length limits.
+        """
         import random
 
         # 丰富的主题列表，增加多样性
@@ -1088,7 +1145,14 @@ class SoupaiPlugin(Star):
             "牺牲某人换取整体安全",
         ]
 
-        selected_theme = random.choice(themes)
+        selected_theme = (
+            theme or self.config.get("generation_theme") or "随机"
+        ).strip()
+        if selected_theme == "随机":
+            selected_theme = random.choice(themes)
+        creative_ideas = (ideas or self.config.get("generation_ideas") or "").strip()
+        if len(selected_theme) > 120 or len(creative_ideas) > 2000:
+            raise ValueError("题材最多 120 字，创作参考最多 2000 字")
 
         prompt = (
             f"你是一个逻辑推理谜题设计师，正在创作一个用于【海龟汤游戏】的原创谜题。\n\n"
@@ -1117,20 +1181,146 @@ class SoupaiPlugin(Star):
             "答案：XXX\n\n"
             f"请基于「{selected_theme}」主题生成一个完全原创的反转推理谜题。"
         )
+        if creative_ideas:
+            prompt += (
+                "\n\n【本次创作参考】：\n"
+                + creative_ideas
+                + "\n请结合以上想法创作，仍须遵守逻辑自洽和题面、答案的输出格式。"
+            )
 
         return prompt
+
+    async def save_story_checked(
+        self,
+        source: str,
+        puzzle: str,
+        answer: str,
+        story_id: str | None = None,
+        umo: str | None = None,
+    ) -> dict:
+        """Check all banks before committing a new or edited story.
+
+        Args:
+            source: Writable target bank, local or custom.
+            puzzle: Public puzzle text.
+            answer: Complete hidden story.
+            story_id: Existing story ID when editing.
+            umo: Session origin for model selection.
+
+        Returns:
+            The saved story with its duplicate-check report.
+
+        Raises:
+            ValueError: Invalid input, duplicate content, or a failed check.
+        """
+        if source not in ("local", "custom"):
+            raise ValueError("只能写入本地或自定义题库")
+        puzzle, answer = puzzle.strip(), answer.strip()
+        if not puzzle or not answer or len(puzzle) > 2000 or len(answer) > 16000:
+            raise ValueError("汤面和汤底不能为空，且分别不得超过 2000 和 16000 字")
+        async with self._story_write_lock:
+            storage = self._storage_of(source)
+            if story_id is not None and storage.find_index(story_id) < 0:
+                raise ValueError("题目不存在或已经删除")
+            report = await self.story_catalog.check(
+                puzzle,
+                answer,
+                exclude=(source, story_id) if story_id is not None else None,
+                umo=umo,
+            )
+            if report["duplicate"]:
+                labels = {
+                    "network": "网络题库",
+                    "local": "本地题库",
+                    "custom": "自定义题库",
+                }
+                matches = "、".join(
+                    f"{labels.get(item['source'], item['source'])} #{item['id']}"
+                    for item in report["matches"][:3]
+                )
+                raise DuplicateStoryError(f"发现重复或冲突题目：{matches}，未写入题库")
+            dropped_id = None
+            with storage.lock:
+                if story_id is not None:
+                    index = storage.find_index(story_id)
+                    if index < 0:
+                        raise ValueError("题目不存在或已经删除")
+                    story = storage.stories[index]
+                    story.update(
+                        puzzle=puzzle,
+                        answer=answer,
+                        updated_at=datetime.now().isoformat(),
+                    )
+                    storage.save_stories()
+                else:
+                    dropped_id = (
+                        storage.stories[0].get("id")
+                        if source == "local"
+                        and len(storage.stories) >= storage.max_size
+                        else None
+                    )
+                    if not storage.add_story(puzzle, answer):
+                        raise ValueError("保存题目失败")
+                    story = storage.stories[-1]
+                saved = dict(story)
+            try:
+                if dropped_id:
+                    self.story_catalog.forget(source, str(dropped_id))
+                if report.get("annotation"):
+                    self.story_catalog.remember(
+                        source, str(saved["id"]), puzzle, answer, report["annotation"]
+                    )
+            except ValueError as exc:
+                logger.warning(
+                    f"Story saved but annotation cache could not be updated: {exc}"
+                )
+                report.setdefault("warnings", []).append(
+                    "题目已保存，但标注缓存写入失败，请稍后重新标注。"
+                )
+            saved["check"] = report
+            return saved
+
+    async def generate_and_store_story(
+        self,
+        theme: str | None = None,
+        ideas: str | None = None,
+        umo: str | None = None,
+    ) -> dict:
+        """Generate and check a story, with at most three generation attempts.
+
+        Args:
+            theme: Optional subject overriding the configured default.
+            ideas: Optional creative brief overriding the configured default.
+            umo: Session origin for model selection.
+
+        Returns:
+            The saved local story.
+
+        Raises:
+            ValueError: Generation or checking failed, or all attempts collided.
+        """
+        avoid_stories = []
+        for attempt in range(3):
+            if avoid_stories:
+                puzzle, answer = await self.generate_story_with_llm(
+                    umo, theme, ideas, avoid_stories=avoid_stories[:]
+                )
+            else:
+                puzzle, answer = await self.generate_story_with_llm(umo, theme, ideas)
+            try:
+                return await self.save_story_checked("local", puzzle, answer, umo=umo)
+            except DuplicateStoryError:
+                if attempt == 2:
+                    raise
+                avoid_stories.append((puzzle, answer))
+                logger.info("Generated story collided; retrying with a new story")
+        raise ValueError("生成的题目重复，请调整创作参考后再试")
 
     async def _generate_for_storage(self) -> bool:
         """为存储库生成故事"""
         try:
-            puzzle, answer = await self.generate_story_with_llm()
-            if puzzle and answer and not puzzle.startswith("（"):
-                self.local_story_storage.add_story(puzzle, answer)
-                logger.info("为存储库生成故事成功")
-                return True
-            else:
-                logger.warning("为存储库生成故事失败")
-                return False
+            await self.generate_and_store_story()
+            return True
         except Exception as e:
             logger.error(f"为存储库生成故事错误: {e}")
             return False
@@ -1606,12 +1796,6 @@ class SoupaiPlugin(Star):
 
             puzzle, answer = story
 
-            # 检查LLM生成是否失败
-            if puzzle == "（无法生成题面，请先配置大语言模型）":
-                yield event.plain_result(f"生成谜题失败：{answer}")
-                self.generating_games.discard(group_id)
-                return
-
             difficulty = self.group_difficulty.get(group_id, "普通")
             diff_conf = self.difficulty_settings.get(
                 difficulty, self.difficulty_settings["普通"]
@@ -2012,7 +2196,9 @@ class SoupaiPlugin(Star):
             story = self._storage_of(source).get_story(session)
             if story:
                 return story
-        return await self.generate_story_with_llm()
+        story = await self.generate_and_store_story(umo=session)
+        self.local_story_storage.mark_used(session, str(story["id"]))
+        return story["puzzle"], story["answer"]
 
     async def get_story_by_index(
         self, source_type: str, index: int, session: str = DEFAULT_SESSION
@@ -2327,7 +2513,7 @@ class SoupaiPlugin(Star):
             return
 
         self.auto_generating = True
-        asyncio.create_task(self._auto_generate_loop())
+        self._generation_loop_task = asyncio.create_task(self._auto_generate_loop())
         yield event.plain_result(
             f"✅ 开始生成备用故事，存储库状态: {storage_info['total']}/{storage_info['max_size']}"
         )
@@ -2577,15 +2763,17 @@ class SoupaiPlugin(Star):
             return
 
         # 添加故事到自定义存储库
-        success = self.custom_story_storage.add_story(puzzle, answer)
-
-        if success:
-            # 获取添加后的故事索引
-            story_index = len(self.custom_story_storage.stories) - 1
-            yield event.plain_result(
-                f"✅ 添加成功！海龟汤编号: {story_index}\n\n"
-                f"📖 汤面: {puzzle}\n"
-                f"📖 汤底: {answer}"
+        try:
+            saved = await self.save_story_checked(
+                "custom", puzzle, answer, umo=event.unified_msg_origin
             )
-        else:
-            yield event.plain_result("❌ 添加失败，请重试")
+        except ValueError as exc:
+            yield event.plain_result(f"❌ 添加失败：{exc}")
+            return
+
+        story_index = self.custom_story_storage.find_index(str(saved["id"]))
+        yield event.plain_result(
+            f"✅ 添加成功！海龟汤编号: {story_index}\n\n"
+            f"📖 汤面: {puzzle}\n"
+            f"📖 汤底: {answer}"
+        )

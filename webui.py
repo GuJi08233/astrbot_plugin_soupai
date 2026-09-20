@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
 from typing import Any
 
 from astrbot.api import logger
@@ -37,6 +37,16 @@ class SoupaiWebApi:
 
     def __init__(self, plugin):
         self.plugin = plugin
+        self.annotation_task: asyncio.Task | None = None
+        self.annotation_job = {
+            "status": "idle",
+            "total": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "errors": [],
+        }
 
     # ------------------------------------------------------------ 注册
 
@@ -50,6 +60,22 @@ class SoupaiWebApi:
             ("/story/delete", self.story_delete, ["POST"], "删除题目"),
             ("/story/hide", self.story_hide, ["POST"], "屏蔽或恢复题目"),
             ("/story/generate", self.story_generate, ["POST"], "让 LLM 生成新题"),
+            (
+                "/story/annotation",
+                self.story_annotation,
+                ["GET"],
+                "查看单题标注（含汤底信息）",
+            ),
+            ("/story/annotate", self.story_annotate, ["POST"], "标注单题"),
+            (
+                "/annotation/preview",
+                self.annotation_preview,
+                ["GET"],
+                "预览批量标注范围",
+            ),
+            ("/annotation/start", self.annotation_start, ["POST"], "启动批量标注"),
+            ("/annotation/status", self.annotation_status, ["GET"], "批量标注进度"),
+            ("/annotation/cancel", self.annotation_cancel, ["POST"], "停止批量标注"),
             ("/usage/mark", self.usage_mark, ["POST"], "标记单题在某会话的出题状态"),
             ("/usage/reset", self.usage_reset, ["POST"], "重置使用记录"),
             ("/games", self.games, ["GET"], "进行中的对局"),
@@ -196,6 +222,9 @@ class SoupaiWebApi:
                     "hidden": sid in storage.hidden_ids,
                     "used": sid in used,
                     "created_at": story.get("created_at"),
+                    "annotation_status": self.plugin.story_catalog.annotation_status(
+                        source, sid, puzzle, answer
+                    ),
                 }
             )
 
@@ -263,9 +292,18 @@ class SoupaiWebApi:
         storage = self._storage(source)
         if storage is None:
             return error_response(f"未知题库: {source}")
-        storage.add_story(puzzle, answer)
+        try:
+            saved = await self.plugin.save_story_checked(source, puzzle, answer)
+        except ValueError as exc:
+            return error_response(str(exc))
         logger.info(f"网页端新增题目到 {source} by {request.username}")
-        return _ok({"total": len(storage.stories)})
+        return _ok(
+            {
+                "total": len(storage.stories),
+                "id": saved["id"],
+                "warnings": saved["check"].get("warnings", []),
+            }
+        )
 
     async def story_update(self):
         data = await self._payload()
@@ -279,13 +317,16 @@ class SoupaiWebApi:
         answer = (data.get("answer") or "").strip()
         if not puzzle or not answer:
             return error_response("汤面和汤底都不能为空")
-        with storage.lock:
-            story["puzzle"] = puzzle
-            story["answer"] = answer
-            story["updated_at"] = datetime.now().isoformat()
-            storage.save_stories()
+        try:
+            saved = await self.plugin.save_story_checked(
+                source, puzzle, answer, story_id=str(data.get("id"))
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
         logger.info(f"网页端修改题目 {source}/{data.get('id')} by {request.username}")
-        return _ok({"id": storage.story_id(story, index)})
+        return _ok(
+            {"id": str(data.get("id")), "warnings": saved["check"].get("warnings", [])}
+        )
 
     async def story_delete(self):
         data = await self._payload()
@@ -298,16 +339,28 @@ class SoupaiWebApi:
         if story is None:
             return error_response("题目不存在")
         story_id = storage.story_id(story, index)
-        with storage.lock:
-            del storage.stories[index]
-            storage.save_stories()
-            for ids in storage.usage.values():
-                ids.discard(story_id)
-            storage.hidden_ids.discard(story_id)
-            storage.save_usage_record()
-            storage.save_hidden_record()
+        warnings = []
+        async with self.plugin._story_write_lock:
+            with storage.lock:
+                index = storage.find_index(story_id)
+                if index < 0:
+                    return error_response("题目不存在")
+                del storage.stories[index]
+                storage.save_stories()
+                for ids in storage.usage.values():
+                    ids.discard(story_id)
+                storage.hidden_ids.discard(story_id)
+                storage.save_usage_record()
+                storage.save_hidden_record()
+            try:
+                self.plugin.story_catalog.forget(source, story_id)
+            except ValueError as exc:
+                logger.warning(f"Story deleted but annotation cleanup failed: {exc}")
+                warnings.append(
+                    "题目已删除，但旧标注缓存清理失败；它不会用于其他题目。"
+                )
         logger.info(f"网页端删除题目 {source}/{story_id} by {request.username}")
-        return _ok({"total": len(storage.stories)})
+        return _ok({"total": len(storage.stories), "warnings": warnings})
 
     async def story_hide(self):
         data = await self._payload()
@@ -327,20 +380,26 @@ class SoupaiWebApi:
             count = min(max(int(data.get("count") or 1), 1), 5)
         except (TypeError, ValueError):
             return error_response("数量不合法")
+        theme, ideas = data.get("theme"), data.get("ideas")
+        if (theme is not None and (not isinstance(theme, str) or len(theme) > 120)) or (
+            ideas is not None and (not isinstance(ideas, str) or len(ideas) > 2000)
+        ):
+            return error_response("题材最多 120 字，创作参考最多 2000 字")
 
         self.plugin._ensure_story_storages()
         created, failed = [], []
         for _ in range(count):
-            puzzle, answer = await self.plugin.generate_story_with_llm()
-            # 生成失败时返回的是括号包起来的提示文案，不能入库
-            if not puzzle or not answer or puzzle.startswith("（"):
-                failed.append(puzzle or "生成失败")
+            try:
+                story = await self.plugin.generate_and_store_story(theme, ideas)
+            except ValueError as exc:
+                failed.append(str(exc))
                 continue
-            self.plugin.local_story_storage.add_story(puzzle, answer)
             created.append(
                 {
-                    "id": self.plugin.local_story_storage.stories[-1].get("id"),
-                    "puzzle": puzzle,
+                    "id": story["id"],
+                    "puzzle": story["puzzle"],
+                    "check_method": story["check"].get("method"),
+                    "warnings": story["check"].get("warnings", []),
                 }
             )
         logger.info(
@@ -352,6 +411,171 @@ class SoupaiWebApi:
                 data={"created": [], "failed": failed},
             )
         return _ok({"created": created, "failed": failed})
+
+    async def story_annotation(self):
+        """Return spoiler-bearing metadata only on an explicit detail request."""
+        source, sid = request.query.get("source") or "", request.query.get("id") or ""
+        _, _, story = self._resolve(source, sid)
+        if story is None:
+            return error_response("题目不存在")
+        catalog = self.plugin.story_catalog
+        return _ok(
+            {
+                "status": catalog.annotation_status(
+                    source, sid, story["puzzle"], story["answer"]
+                ),
+                "annotation": catalog.get_annotation(
+                    source, sid, story["puzzle"], story["answer"]
+                ),
+            }
+        )
+
+    async def story_annotate(self):
+        """Annotate one explicitly selected story without editing its bank."""
+        data = await self._payload()
+        source, sid = str(data.get("source") or ""), str(data.get("id") or "")
+        if not isinstance(data.get("force", False), bool):
+            return error_response("force 必须为布尔值")
+        try:
+            annotation = await self.plugin.story_catalog.annotate(
+                source, sid, force=data.get("force", False)
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
+        return _ok({"status": "ready", "annotation": annotation})
+
+    async def annotation_preview(self):
+        """Count the selected stories without invoking any model."""
+        source = request.query.get("source") or "all"
+        if source not in ("all", "network", "local", "custom"):
+            return error_response("未知题库")
+        force = request.query.get("force") == "1"
+        entries = [
+            e
+            for e in self.plugin.story_catalog.entries()
+            if source == "all" or e["source"] == source
+        ]
+        ready = sum(
+            self.plugin.story_catalog.annotation_status(
+                e["source"], e["id"], e["puzzle"], e["answer"]
+            )
+            == "ready"
+            for e in entries
+        )
+        return _ok(
+            {
+                "total": len(entries),
+                "ready": ready,
+                "pending": len(entries) if force else len(entries) - ready,
+            }
+        )
+
+    async def annotation_start(self):
+        """Start a bounded background annotation job after an explicit request."""
+        if self.annotation_task is not None and not self.annotation_task.done():
+            return error_response("已有标注任务正在运行，请先等待或取消")
+        data = await self._payload()
+        if self.annotation_task is not None and not self.annotation_task.done():
+            return error_response("已有标注任务正在运行，请先等待或取消")
+        source, force = data.get("source") or "all", data.get("force", False)
+        if source not in ("all", "network", "local", "custom") or not isinstance(
+            force, bool
+        ):
+            return error_response("标注范围或 force 参数不合法")
+        provider_id = next(
+            (
+                value
+                for key in (
+                    "annotation_llm_provider",
+                    "verify_llm_provider",
+                    "judge_llm_provider",
+                )
+                if (value := str(self.plugin.config.get(key) or "").strip())
+            ),
+            "",
+        )
+        provider = self.plugin._resolve_provider(provider_id)
+        if provider is None or not callable(getattr(provider, "text_chat", None)):
+            return error_response("请先配置可用的题库标注或验证模型")
+        entries = [
+            e
+            for e in self.plugin.story_catalog.entries()
+            if source == "all" or e["source"] == source
+        ]
+        pending = [
+            e
+            for e in entries
+            if force
+            or self.plugin.story_catalog.annotation_status(
+                e["source"], e["id"], e["puzzle"], e["answer"]
+            )
+            != "ready"
+        ]
+        skipped = len(entries) - len(pending)
+        self.annotation_job = {
+            "status": "running" if pending else "completed",
+            "total": len(entries),
+            "processed": skipped,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": skipped,
+            "errors": [],
+        }
+        if pending:
+            self.annotation_task = asyncio.create_task(
+                self._run_annotations(pending, force)
+            )
+        return _ok({"job": self.annotation_job})
+
+    async def _run_annotations(self, entries: list[dict], force: bool) -> None:
+        """Process one annotation at a time and retain completed work on cancel.
+
+        Args:
+            entries: Snapshot of selected stories.
+            force: Whether to refresh existing annotations.
+        """
+        job = self.annotation_job
+        try:
+            for entry in entries:
+                try:
+                    await self.plugin.story_catalog.annotate(
+                        entry["source"], entry["id"], force=force
+                    )
+                    job["succeeded"] += 1
+                except Exception as exc:
+                    logger.warning(f"Story annotation failed: {exc}")
+                    job["failed"] += 1
+                    if len(job["errors"]) < 20:
+                        job["errors"].append(
+                            {
+                                "source": entry["source"],
+                                "id": entry["id"],
+                                "message": str(exc)
+                                if isinstance(exc, ValueError)
+                                else "标注失败，请查看日志",
+                            }
+                        )
+                job["processed"] += 1
+            job["status"] = "completed"
+        except asyncio.CancelledError:
+            job["status"] = "cancelled"
+            raise
+        except Exception:
+            job["status"] = "failed"
+            logger.exception("Annotation job failed")
+
+    async def annotation_status(self):
+        """Return job progress without annotation content."""
+        return _ok({"job": self.annotation_job})
+
+    async def annotation_cancel(self):
+        """Cancel only the active job, preserving already saved annotations."""
+        task, job = self.annotation_task, self.annotation_job
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            job["status"] = "cancelled"
+        return _ok({"job": self.annotation_job})
 
     async def usage_mark(self):
         """把某道题在某个会话标成已出或未出。"""
@@ -409,11 +633,26 @@ class SoupaiWebApi:
         "verification_limit": (0, 100),
     }
 
-    def _providers_payload(self) -> list[dict]:
-        """AstrBot 里已配置的对话模型，供网页端的提供商下拉框用。"""
+    def _providers_payload(self, kind: str = "chat") -> list[dict]:
+        """List configured providers for one kind of settings dropdown.
+
+        Args:
+            kind: Chat, embedding, or rerank provider category.
+
+        Returns:
+            Provider IDs, model labels, and enabled states without credentials.
+        """
         providers = []
         try:
-            for provider in self.plugin.context.get_all_providers():
+            if kind == "embedding":
+                instances = self.plugin.context.get_all_embedding_providers()
+            elif kind == "rerank":
+                instances = getattr(
+                    self.plugin.context.provider_manager, "rerank_provider_insts", []
+                )
+            else:
+                instances = self.plugin.context.get_all_providers()
+            for provider in instances:
                 meta = provider.meta()
                 providers.append(
                     {
@@ -445,6 +684,8 @@ class SoupaiWebApi:
                 "schema": config.schema or {},
                 "values": values,
                 "providers": self._providers_payload(),
+                "embedding_providers": self._providers_payload("embedding"),
+                "rerank_providers": self._providers_payload("rerank"),
                 # 密文不回显，但前端需要知道有没有设过，好显示占位提示
                 "has_jev_api_key": bool(str(config.get("jev_api_key") or "").strip()),
             }
@@ -489,6 +730,10 @@ class SoupaiWebApi:
                 value = bool(value)
             elif ftype == "string":
                 value = str(value)
+                if key in ("generation_theme", "generation_ideas"):
+                    limit = 120 if key == "generation_theme" else 2000
+                    if len(value) > limit:
+                        return error_response(f"{key} 最多 {limit} 字")
                 if meta.get("options") and value not in meta["options"]:
                     return error_response(f"{key} 的值不合法: {value}")
             else:

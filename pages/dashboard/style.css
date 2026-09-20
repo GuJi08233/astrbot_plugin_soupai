@@ -120,7 +120,7 @@ body {
 .card-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
 .puzzle { margin: 0 0 10px; white-space: pre-wrap; word-break: break-word; }
 
-.tags { display: flex; gap: 6px; }
+.tags { display: flex; gap: 6px; flex-wrap: wrap; }
 .tag {
   padding: 2px 8px; border-radius: 20px; font-size: 11px;
   background: var(--bg); color: var(--muted); border: 1px solid var(--border);
@@ -128,6 +128,8 @@ body {
 .tag-used { background: var(--used-bg); color: var(--used); border-color: transparent; }
 .tag-muted { opacity: .7; }
 .tag-live { background: var(--ok); color: var(--surface); border-color: transparent; }
+.tag-ready { color: var(--ok); }
+.tag-stale { color: var(--used); background: var(--used-bg); }
 
 /* ── 汤底 ── */
 .answer { border-top: 1px dashed var(--border); padding-top: 10px; }
@@ -185,13 +187,14 @@ body {
   display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
 }
 .modal[hidden] { display: none; }
+#confirmModal { z-index: 60; }
 .modal-box {
   background: var(--surface); border-radius: 12px; padding: 20px;
   width: min(620px, 100%); max-height: 90vh; overflow: auto;
 }
 .modal-box h3 { margin: 0 0 14px; }
 .modal-sm { width: min(420px, 100%); }
-.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
 .note {
   margin: 0 0 14px; padding: 8px 11px; border-radius: 8px;
   background: var(--used-bg); color: var(--used); font-size: 13px;
@@ -199,6 +202,7 @@ body {
 #confirmDetail { margin: 0; }
 #confirmDetail[hidden] { display: none; }
 .field { display: block; margin-bottom: 12px; }
+.field[hidden] { display: none; }
 .field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 13px; }
 .field textarea {
   width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px;
@@ -211,6 +215,16 @@ body {
   border-radius: 8px; max-height: 320px; overflow: auto;
 }
 .gen-item { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
+
+/* Annotation controls and explicitly revealed story details. */
+.annotation-force { margin-bottom: 12px; }
+.annotation-detail { white-space: pre-wrap; overflow-wrap: anywhere; }
+.annotation-detail h4 { margin: 16px 0 4px; }
+.annotation-detail p { margin: 4px 0; }
+.annotation-detail ol { margin: 4px 0; padding-left: 22px; }
+.annotation-job { border-top: 1px solid var(--border); padding-top: 8px; }
+.annotation-job progress { width: 100%; accent-color: var(--accent); }
+#annotationErrorList { max-height: 180px; overflow-y: auto; overflow-wrap: anywhere; padding-left: 22px; }
 
 /* ── 设置 ── */
 .config-form {

@@ -8,7 +8,12 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 
 ## Architecture
 
-- **Single-file plugin**: All functionality in `main.py` (~2450 lines)
+- **Game and admission flow**: `main.py` owns the plugin, game state, generation,
+  model selection, and serialized `save_story_checked()` writes
+- **Story catalog**: `story_catalog.py` owns sidecar annotations, content-version
+  invalidation, cross-library duplicate checks, embedding caches, and reranking
+- **Web management**: `webui.py` owns API routes and the explicit annotation job;
+  `pages/dashboard/` is the static management frontend
 - **AstrBot framework**: Built on AstrBot >= 4.16, < 5
 - **Thread-safe storage**: `ThreadSafeStoryStorage` class for managing puzzle usage
 - **Game state management**: `GameState` class tracks active games per group
@@ -21,15 +26,19 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
   stable `id` (sha1 of the puzzle text, first 12 hex chars)
 - **Configuration**: `_conf_schema.json` defines plugin settings
 - **Metadata**: `metadata.yaml` for plugin registration
+- **Derived story data**: `story_catalog.json` in the plugin data directory;
+  keep annotations and embedding vectors out of the shipped puzzle files
 
 ## Development Commands
 
 This is an AstrBot plugin, so development involves:
-1. **Testing**: Run `python -m unittest discover -s tests -p test_judging.py`
+1. **Testing**: Run `python -m unittest discover -s tests -p 'test_*.py'`
    from this plugin directory using AstrBot's Python environment. These tests
-   mock model requests and framework imports; no live game or API key is needed.
-2. **Linting**: No specific linting configuration found
-3. **Building**: No build process - it's a Python plugin file
+   mock model requests and use temporary data; no live game or API key is needed.
+   Set a 60-second process timeout when running tests in the background.
+2. **Linting**: Use `ruff check main.py story_catalog.py webui.py tests` and
+   `ruff format main.py story_catalog.py webui.py tests`.
+3. **Building**: No build process; Python modules and static HTML/CSS/JavaScript
 4. **Installation**: Copy to `AstrBot/data/plugins/` directory
 
 ## Plugin Structure
@@ -56,7 +65,10 @@ This is an AstrBot plugin, so development involves:
   settings independently follow `judge_llm_provider`; if that is also empty,
   resolve the current session's model through `umo`. This allows a fast
   question model and a stronger verification model without changing puzzle
-  generation or hint selection.
+  generation or hint selection. `annotation_llm_provider` handles both story
+  annotation and duplicate review; when empty, it follows `verify_llm_provider`,
+  then `judge_llm_provider`, then the session/system default through the same
+  resolver. Embedding and rerank providers are separate optional model types.
 - **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
   config) or `self._safe_send()` (swallows send failures). Do not call
   `event.send(event.plain_result(...))` directly on paths that end a game.
@@ -73,35 +85,92 @@ This is an AstrBot plugin, so development involves:
   classify the same way, or flipping the setting changes how the game feels.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 - **Config schema**: `_conf_schema.json` is rendered by the dashboard's
-  `ConfigItemRenderer`. Four provider fields carry `"_special":
+  `ConfigItemRenderer`. Five chat-provider fields carry `"_special":
   "select_provider"`, which swaps the text box for the same provider dropdown
   the core settings use — it emits the provider `id`, which is exactly the key
   `get_provider_by_id` expects. Enum fields pair `options` with a same-length
   `labels` array so the panel shows Chinese instead of the raw value.
   Jev-only fields carry `"condition": {"judge_engine": "jev"}` and are hidden
   until that engine is chosen; the keys still exist in the saved config, so
-  nothing in `main.py` needs to care whether they were visible.
+  nothing in `main.py` needs to care whether they were visible. The optional
+  duplicate retrieval fields use `select_embedding_provider` and
+  `select_rerank_provider`; `/config` supplies separate `embedding_providers`
+  and `rerank_providers` lists for the plugin page.
 
 ## Important Patterns
 
-- **Thread safety**: Uses `threading.Lock` for shared state
-- **Persistence**: JSON files for usage tracking
+- **Thread safety**: Storage and catalog use reentrant thread locks; the
+  `asyncio.Lock` around `save_story_checked()` serializes checking with admission
+- **Persistence**: JSON source banks, usage/blocklist files, and a derived
+  catalog keyed by source, stable story ID, and a puzzle/answer content hash
 - **Error handling**: Comprehensive try-catch blocks with logging
 - **Configuration**: Managed through AstrBot's plugin configuration system
 
 ## Development Workflow
 
-1. Modify `main.py`
-2. Reload plugin in AstrBot WebUI
-3. Test commands in chat
-4. Check logs for errors
+1. Modify the relevant module or static page, keeping source banks unchanged
+2. Run the unit tests and applicable Python/JavaScript checks
+3. Use isolated mocks for page flows before testing against an active plugin
+4. Reload and test commands only when the current task authorizes live testing
 
 ## Key Files
 
 - `main.py` - Core plugin implementation
+- `story_catalog.py` - Sidecar metadata, duplicate checks, and retrieval caches
+- `webui.py` - Management API and explicit batch annotation lifecycle
+- `pages/dashboard/` - Static management page and iframe bridge client
+- `tests/` - Mocked judging, generation, catalog, and management regression tests
 - `network_soupai.json` - Puzzle database
 - `_conf_schema.json` - Configuration schema
 - `metadata.yaml` - Plugin metadata
+
+## Story Annotation and Duplicate Admission
+
+`StoryCatalog` keeps derived `theme`, `tags`, `summary`, `causal_chain`, and
+`twist` data in `story_catalog.json`, separate from every source library.
+`tags` and `causal_chain` are string arrays. Validate the entire annotation
+schema before accepting it; do not invent fields from malformed model output.
+Status is `missing`, `ready`, or `stale`, based on the current puzzle/answer
+content hash. Only return metadata matching that content version. An annotation
+request that finishes after the story was edited or deleted must not save its
+outdated result. Never write generated metadata into `network_soupai.json`.
+
+All supported new and edited story writes must go through
+`plugin.save_story_checked()`. Its async write lock covers both the catalog
+check and the eventual mutation, so concurrent requests and consecutive stories
+in one generation batch see earlier accepted writes. Editing excludes only its
+own `(source, id)` pair. Exact checks always span all three libraries: normalized
+identical puzzle/answer pairs, identical puzzles with conflicting answers, and
+identical answers under different puzzles are rejected. Normalization ignores
+whitespace, punctuation, and full-width/half-width differences.
+
+`dedup_semantic_enabled` defaults to `True`. After exact checks pass, admission
+may call the annotation LLM, an optional embedding provider, an optional rerank
+provider, and the LLM duplicate reviewer. This applies to manual edits too;
+do not describe saving as always local or free of model calls. With semantic
+checks disabled, exact checks still run and explicitly requested annotation
+remains available. Existing stories without current annotations remain eligible
+for retrieval using their original text; do not annotate the full bank merely
+because someone opens the page or submits one story.
+
+The first check with an embedding provider can build vectors for the existing
+bank. Cache identity includes provider/model information and document content;
+do not reuse vectors across model or incompatible dimension changes. With no
+embedding provider, local text similarity retrieves candidates and can miss
+heavily reworded copies. Rerank relevance scores only select candidates; they
+are not duplicate probabilities. The final LLM review compares original puzzle
+and answer causality, character relationships, and the twist. A shared theme or
+a generic mechanism alone is insufficient evidence of duplication.
+
+Generation uses `generation_theme` (default `随机`) and `generation_ideas`
+(default empty), with nonempty per-request `theme` and `ideas` overriding them.
+Limits are 120 and 2000 characters respectively. `generate_and_store_story()`
+allows at most three generation attempts, including the first, and retries only
+duplicate collisions. Generation/check errors must not become stored stories.
+Keep already accepted items when a later item in a batch fails. If a story was
+saved but derived cache persistence fails, report a saved result with warnings;
+do not tell the editor that the story was never saved. This is not a transaction
+guarantee across multiple JSON files.
 
 ## Web UI
 
@@ -139,9 +208,10 @@ upstream. Hiding a puzzle writes to a blocklist under the plugin data dir
 instead.
 
 The settings tab is generated from `config.schema`, which the `/config` route
-sends to the page verbatim — `options`, `labels`, `condition`, `secret` and
-`_special: select_provider` are all honoured, so a new `_conf_schema.json`
-item shows up on the web without frontend changes. Saving goes through
+sends to the page verbatim. The page honours `options`, `labels`, `condition`,
+`secret`, and the three provider selectors (`select_provider`,
+`select_embedding_provider`, `select_rerank_provider`). New supported schema
+items appear without frontend changes. Saving goes through
 `config/save` → `config.save_config(replace)` → `plugin._load_config()`;
 `save_config` alone does NOT rebuild the plugin instance (the panel path
 reloads, this one doesn't), which is exactly why `_load_config` exists. The
@@ -158,6 +228,37 @@ Keep unsaved settings when switching tabs, confirm before manually discarding
 them, and do not overwrite edits made while a settings request is in flight.
 Jev details belong to each question record and remain inspectable after an
 LLM fallback; display missing data explicitly instead of reconstructing it.
+
+The generation dialog posts `{count, theme, ideas}` to `story/generate`; empty
+theme or ideas means to use the configured default. Keep generation inputs and
+editor drafts when a request fails. `story/create`, `story/update`, and each
+successfully created generation item can contain `warnings: string[]`: these
+are successful saved results with additional notices, not save failures.
+
+Annotation UI stays inside the existing stories tab:
+
+- `GET story/annotation?source=...&id=...` returns `{status, annotation}` only
+  after the user explicitly opens the detail view. Lists expose annotation
+  status only; tags, summary, causality, and twist can reveal the answer.
+- `POST story/annotate` takes `{source, id, force?}` after an explicit action.
+  Opening either the list or the detail view must never start this request.
+- `GET annotation/preview?source=...&force=0|1` returns `{total, ready, pending}`
+  without model calls. Source is `network`, `local`, `custom`, or `all`; forced
+  previews count all entries as pending.
+- `POST annotation/start` takes `{source, force}` and is the only way to start
+  the batch. `GET annotation/status` reads the current plugin-wide job and
+  `POST annotation/cancel` cancels it. All three return `{job}`. Job status is
+  `idle`, `running`, `completed`, `cancelled`, or `failed`, with `total`,
+  `processed`, `succeeded`, `failed`, `skipped`, and bounded `errors` entries.
+
+The batch dialog first previews the selection and restores the current job,
+then requires an explicit start. Poll status every two seconds only while the
+dialog is open, serialize poll/action requests, and clear the timer on close.
+Closing the dialog does not cancel the job; reopening restores its current
+status. Completed annotations are persisted per story and survive cancellation.
+The job counters are in memory, so a plugin reload requires a fresh preview
+and explicit start; non-forced jobs skip existing valid annotations. Do not
+add an automatic full-library annotation task during plugin initialization.
 
 ## Invariants Worth Keeping
 
@@ -184,5 +285,11 @@ LLM fallback; display missing data explicitly instead of reconstructing it.
   so each game carries a `session` field to tie the two together — keep writing
   it in `start_game`, the web UI relies on it.
 - **Never put an answer in a list response.** `stories` and `games` return
-  puzzles only; `story/answer` is a separate, deliberate request.
+  puzzles only; `story/answer` is a separate, deliberate request. Annotation
+  content is equally spoiler-bearing and belongs only in explicit detail
+  responses, never list rows, progress payloads, or duplicate error messages.
+- **Never bypass checked admission.** New and edited stories from web, chat,
+  automatic generation, and manual generation all use `save_story_checked()`.
+  A model failure or malformed duplicate review is not a successful check.
+  Preserve the async check-and-write boundary when adding another entry point.
 - Format with `ruff check --fix && ruff format` before committing.

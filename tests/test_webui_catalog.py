@@ -1,0 +1,280 @@
+"""Regression tests for annotation jobs and checked WebUI admission."""
+
+import asyncio
+import importlib.util
+import logging
+import sys
+import threading
+import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+
+class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.request = SimpleNamespace(
+            json=AsyncMock(return_value={}), query={}, username="test"
+        )
+        api_module = ModuleType("astrbot.api")
+        api_module.logger = logging.getLogger("soupai.api.tests")
+        web_module = ModuleType("astrbot.api.web")
+        web_module.json_response = lambda value: value
+        web_module.error_response = lambda message, **kwargs: {
+            "status": "error",
+            "message": message,
+            **kwargs,
+        }
+        web_module.request = self.request
+        path = Path(__file__).resolve().parents[1] / "webui.py"
+        spec = importlib.util.spec_from_file_location("soupai_webui_test", path)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(
+            sys.modules, {"astrbot.api": api_module, "astrbot.api.web": web_module}
+        ):
+            spec.loader.exec_module(module)
+        self.entries = [
+            {
+                "source": "network",
+                "id": "one",
+                "puzzle": "First puzzle",
+                "answer": "Hidden answer one",
+            },
+            {
+                "source": "custom",
+                "id": "two",
+                "puzzle": "Second puzzle",
+                "answer": "Hidden answer two",
+            },
+        ]
+        self.catalog = SimpleNamespace(
+            entries=Mock(return_value=self.entries),
+            annotation_status=Mock(return_value="missing"),
+            get_annotation=Mock(return_value=None),
+            annotate=AsyncMock(return_value={"theme": "test"}),
+            forget=Mock(),
+        )
+        self.storage = SimpleNamespace(
+            stories=[dict(self.entries[0])],
+            lock=threading.RLock(),
+            used_ids=Mock(return_value=set()),
+            hidden_ids=set(),
+            story_id=lambda story, index: story["id"],
+            find_index=lambda sid: 0 if sid == "one" else -1,
+            save_stories=Mock(),
+            usage={},
+            save_usage_record=Mock(),
+            save_hidden_record=Mock(),
+        )
+        self.plugin = SimpleNamespace(
+            story_catalog=self.catalog,
+            config={},
+            _ensure_story_storages=Mock(),
+            online_story_storage=self.storage,
+            local_story_storage=self.storage,
+            custom_story_storage=self.storage,
+            _resolve_provider=Mock(return_value=SimpleNamespace(text_chat=AsyncMock())),
+            _story_write_lock=asyncio.Lock(),
+            save_story_checked=AsyncMock(
+                return_value={"id": "saved", "check": {"warnings": []}}
+            ),
+            generate_and_store_story=AsyncMock(
+                return_value={
+                    "id": "saved",
+                    "puzzle": "Generated",
+                    "answer": "Hidden",
+                    "check": {"method": "text+llm"},
+                }
+            ),
+        )
+        self.api = module.SoupaiWebApi(self.plugin)
+
+    async def test_preview_only_counts_and_does_not_call_models(self):
+        self.catalog.annotation_status.side_effect = ["ready", "missing"]
+        result = await self.api.annotation_preview()
+        self.assertEqual(result["data"], {"total": 2, "ready": 1, "pending": 1})
+        self.catalog.annotate.assert_not_awaited()
+        self.plugin._resolve_provider.assert_not_called()
+        self.assertIsNone(self.api.annotation_task)
+
+    async def test_force_preview_includes_already_annotated_stories(self):
+        self.request.query = {"source": "network", "force": "1"}
+        self.catalog.annotation_status.return_value = "ready"
+        result = await self.api.annotation_preview()
+        self.assertEqual(result["data"], {"total": 1, "ready": 1, "pending": 1})
+        self.catalog.annotate.assert_not_awaited()
+
+    async def test_list_returns_status_without_answer_or_annotation(self):
+        self.catalog.get_annotation.return_value = {"twist": "Private twist"}
+        result = await self.api.stories()
+        item = result["data"]["items"][0]
+        self.assertEqual(item["annotation_status"], "missing")
+        self.assertNotIn("answer", item)
+        self.assertNotIn("annotation", item)
+        self.assertNotIn("Hidden answer", str(result))
+        self.assertNotIn("Private twist", str(result))
+        self.catalog.get_annotation.assert_not_called()
+
+    async def test_annotation_details_require_a_separate_request(self):
+        self.request.query = {"source": "network", "id": "one"}
+        annotation = {"twist": "Explicitly requested detail"}
+        self.catalog.get_annotation.return_value = annotation
+        result = await self.api.story_annotation()
+        self.assertEqual(result["data"]["annotation"], annotation)
+
+    async def test_batch_skips_ready_records_and_tracks_failures(self):
+        self.catalog.annotation_status.side_effect = ["ready", "missing"]
+        self.catalog.annotate.side_effect = ValueError("Synthetic model failure")
+        result = await self.api.annotation_start()
+        self.assertEqual(result["status"], "ok")
+        await self.api.annotation_task
+        job = self.api.annotation_job
+        self.assertEqual(
+            (job["processed"], job["total"], job["skipped"], job["failed"]),
+            (2, 2, 1, 1),
+        )
+        self.catalog.annotate.assert_awaited_once_with("custom", "two", force=False)
+        self.assertEqual(job["errors"][0]["id"], "two")
+
+    async def test_cancellation_preserves_completed_progress(self):
+        waiting = asyncio.Event()
+
+        async def annotate(source, sid, force=False):
+            if sid == "two":
+                waiting.set()
+                await asyncio.Event().wait()
+            return {"theme": "saved"}
+
+        self.catalog.annotate.side_effect = annotate
+        await self.api.annotation_start()
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        result = await self.api.annotation_cancel()
+        self.assertEqual(result["data"]["job"]["status"], "cancelled")
+        self.assertEqual(self.api.annotation_job["succeeded"], 1)
+        self.assertEqual(self.api.annotation_job["processed"], 1)
+
+    async def test_concurrent_starts_create_only_one_job(self):
+        gate = asyncio.Event()
+        calls = 0
+
+        async def payload(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                gate.set()
+            await gate.wait()
+            return {}
+
+        async def annotate(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        self.request.json.side_effect = payload
+        self.catalog.annotate.side_effect = annotate
+        results = await asyncio.gather(
+            self.api.annotation_start(), self.api.annotation_start()
+        )
+        self.assertEqual(
+            sorted(result["status"] for result in results), ["error", "ok"]
+        )
+        await self.api.annotation_cancel()
+
+    async def test_unavailable_model_does_not_start_batch(self):
+        self.plugin._resolve_provider.return_value = None
+        result = await self.api.annotation_start()
+        self.assertEqual(result["status"], "error")
+        self.assertIsNone(self.api.annotation_task)
+        self.catalog.annotate.assert_not_awaited()
+
+    async def test_batch_trims_model_id_and_rejects_non_chat_provider(self):
+        self.plugin.config = {
+            "annotation_llm_provider": "  ",
+            "verify_llm_provider": " strong ",
+        }
+        self.plugin._resolve_provider.return_value = SimpleNamespace(
+            get_embeddings=AsyncMock()
+        )
+        result = await self.api.annotation_start()
+        self.assertEqual(result["status"], "error")
+        self.plugin._resolve_provider.assert_called_once_with("strong")
+        self.assertIsNone(self.api.annotation_task)
+
+    async def test_cancelling_old_task_does_not_cancel_a_new_jobs_state(self):
+        old_task = asyncio.create_task(asyncio.Event().wait())
+        old_job = dict(self.api.annotation_job, status="running")
+        new_job = dict(self.api.annotation_job, status="running")
+        self.api.annotation_task = old_task
+        self.api.annotation_job = old_job
+
+        def start_replacement(task):
+            self.api.annotation_task = asyncio.create_task(asyncio.Event().wait())
+            self.api.annotation_job = new_job
+
+        old_task.add_done_callback(start_replacement)
+        await self.api.annotation_cancel()
+        self.assertEqual(old_job["status"], "cancelled")
+        self.assertEqual(new_job["status"], "running")
+        self.assertFalse(self.api.annotation_task.done())
+        await self.api.annotation_cancel()
+
+    async def test_cache_failure_after_deletion_is_reported_as_a_warning(self):
+        self.request.json.return_value = {"source": "custom", "id": "one"}
+        self.catalog.forget.side_effect = ValueError("Synthetic cache failure")
+        result = await self.api.story_delete()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(self.storage.stories, [])
+        self.assertTrue(result["data"]["warnings"])
+
+    async def test_create_uses_shared_admission_and_exposes_collision(self):
+        self.request.json.return_value = {
+            "source": "custom",
+            "puzzle": "New puzzle",
+            "answer": "New answer",
+        }
+        self.plugin.save_story_checked.side_effect = ValueError("Duplicate story")
+        result = await self.api.story_create()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["message"], "Duplicate story")
+        self.plugin.save_story_checked.assert_awaited_once_with(
+            "custom", "New puzzle", "New answer"
+        )
+
+    async def test_update_checks_with_original_stable_id(self):
+        self.request.json.return_value = {
+            "source": "custom",
+            "id": "one",
+            "puzzle": "Edited",
+            "answer": "Edited answer",
+        }
+        result = await self.api.story_update()
+        self.assertEqual(result["status"], "ok")
+        self.plugin.save_story_checked.assert_awaited_once_with(
+            "custom", "Edited", "Edited answer", story_id="one"
+        )
+
+    async def test_generated_results_forward_preferences_without_revealing_answers(
+        self,
+    ):
+        self.request.json.return_value = {
+            "count": 1,
+            "theme": "校园",
+            "ideas": "一封寄错的信",
+        }
+        result = await self.api.story_generate()
+        self.plugin.generate_and_store_story.assert_awaited_once_with(
+            "校园", "一封寄错的信"
+        )
+        self.assertEqual(result["data"]["created"][0]["check_method"], "text+llm")
+        self.assertNotIn("answer", result["data"]["created"][0])
+
+    async def test_failed_generation_never_reports_created_story(self):
+        self.plugin.generate_and_store_story.side_effect = ValueError(
+            "Invalid generated output"
+        )
+        result = await self.api.story_generate()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["data"]["created"], [])
+        self.assertEqual(result["data"]["failed"], ["Invalid generated output"])
+
+
+if __name__ == "__main__":
+    unittest.main()

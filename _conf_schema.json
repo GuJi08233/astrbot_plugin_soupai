@@ -27,6 +27,45 @@
     "hint": "独立选择 /提示 使用的模型；留空跟随判断问答的 LLM 服务商。",
     "default": ""
   },
+  "generation_theme": {
+    "description": "默认出题题材",
+    "type": "string",
+    "hint": "可填写日常悬疑、校园、职场、温情等题材；随机表示每次随机选题。网页生成可单独指定本次题材。",
+    "default": "随机"
+  },
+  "generation_ideas": {
+    "description": "默认创作参考",
+    "type": "string",
+    "hint": "供后台自动生成参考的想法或限制，最多 2000 字；网页生成可填写本次创作参考。",
+    "default": ""
+  },
+  "annotation_llm_provider": {
+    "description": "题库标注与查重复核的 LLM 服务商",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "用于结构化标注题材、因果链、反转以及比较相似故事。留空跟随验证答案模型，再跟随判断问答模型。",
+    "default": ""
+  },
+  "dedup_semantic_enabled": {
+    "description": "入库时进行语义查重",
+    "type": "bool",
+    "hint": "开启后，新题入库前用 LLM 标注并复核相似题，可能额外调用模型；关闭后仍检查三个题库的相同汤面和汤底。显式批量标注需在题库页面启动。",
+    "default": true
+  },
+  "dedup_embedding_provider": {
+    "description": "题库查重的嵌入服务商",
+    "type": "string",
+    "_special": "select_embedding_provider",
+    "hint": "可选。填写 AstrBot 已配置的嵌入模型 ID，或在海龟汤管理页下拉选择。首次查重会建立并缓存题库向量；留空使用文字相似度召回。",
+    "default": ""
+  },
+  "dedup_rerank_provider": {
+    "description": "题库查重的重排服务商",
+    "type": "string",
+    "_special": "select_rerank_provider",
+    "hint": "可选。填写 AstrBot 已配置的重排模型 ID，或在海龟汤管理页选择。重排仅筛选候选，最终仍由 LLM 判断是否为同一故事；留空不重排。",
+    "default": ""
+  },
   "game_timeout": {
     "description": "游戏超时时间（秒）",
     "type": "int",

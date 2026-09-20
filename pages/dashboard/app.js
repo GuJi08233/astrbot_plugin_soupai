@@ -100,7 +100,11 @@
     sources: [],
     sessions: [],
     editing: null, // null=新增
+    editorSource: 'custom',
+    editorVersion: 0,
   };
+
+  const ANNOTATION_LABELS = { missing: '未标注', ready: '已标注', stale: '标注已过期' };
 
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => {
@@ -271,12 +275,16 @@
   }
 
   function renderStory(item, readonly) {
+    const source = state.source;
     const card = el('div', 'card' + (item.hidden ? ' is-hidden' : ''));
 
     const head = el('div', 'card-head');
     const tags = el('div', 'tags');
     if (item.used) tags.appendChild(el('span', 'tag tag-used', state.session ? '本会话已出' : '出过'));
     if (item.hidden) tags.appendChild(el('span', 'tag tag-muted', '已屏蔽'));
+    const annotationStatus = item.annotation_status || 'missing';
+    const annotationTag = el('span', `tag tag-${annotationStatus}`, ANNOTATION_LABELS[annotationStatus] || '未标注');
+    tags.appendChild(annotationTag);
     head.appendChild(tags);
     head.appendChild(el('span', 'card-id', `#${item.index}`));
     card.appendChild(head);
@@ -290,7 +298,7 @@
       reveal.disabled = true;
       reveal.textContent = '加载中…';
       try {
-        const data = await api.get('story/answer', { source: state.source, id: item.id });
+        const data = await api.get('story/answer', { source, id: item.id });
         answerBox.innerHTML = '';
         answerBox.appendChild(el('p', 'answer-text', data.answer));
         const hide = el('button', 'btn btn-ghost btn-sm', '收起');
@@ -313,14 +321,15 @@
     const actions = el('div', 'card-actions');
     if (!readonly) {
       const edit = el('button', 'btn btn-sm', '编辑');
-      edit.onclick = () => openEditor(item);
+      edit.onclick = () => openEditor(item, source);
       actions.appendChild(edit);
 
       const del = el('button', 'btn btn-sm btn-danger', '删除');
       del.onclick = async () => {
         const ok = await confirmDialog('删除这道题？', item.puzzle, { okText: '删除' });
         if (!ok) return;
-        await guard(api.post('story/delete', { source: state.source, id: item.id }), '已删除');
+        const result = await guard(api.post('story/delete', { source, id: item.id }), '已删除');
+        if (result?.warnings?.length) toast(`已删除；提示：${result.warnings.join('；')}`, 'info');
         await refreshCurrentTab();
       };
       actions.appendChild(del);
@@ -330,19 +339,51 @@
     hideBtn.title = '屏蔽后不会再被抽到，但题目仍保留';
     hideBtn.onclick = async () => {
       await guard(
-        api.post('story/hide', { source: state.source, id: item.id, hidden: !item.hidden }),
+        api.post('story/hide', { source, id: item.id, hidden: !item.hidden }),
         item.hidden ? '已取消屏蔽' : '已屏蔽',
       );
       await refreshCurrentTab();
     };
     actions.appendChild(hideBtn);
 
+    const viewAnnotation = el('button', 'btn btn-sm', '查看标注');
+    viewAnnotation.title = '主动查看标注；内容包含汤底';
+    viewAnnotation.onclick = () => openAnnotation(source, item);
+    actions.appendChild(viewAnnotation);
+    const annotationError = el('p', 'error-text');
+    annotationError.hidden = true;
+    const annotate = el('button', 'btn btn-sm', 'LLM 标注');
+    annotate.onclick = async () => {
+      const force = item.annotation_status === 'ready';
+      const confirmed = await confirmDialog(force ? '重新标注这道题？' : '使用 LLM 标注这道题？',
+        '将把汤面和汤底提交给配置的标注 LLM；标注完成后仍需主动点击“查看标注”才会展示内容。',
+        { danger: false, okText: force ? '重新标注' : '开始标注' });
+      if (!confirmed) return;
+      annotate.disabled = true;
+      annotate.textContent = '标注中…';
+      annotationError.hidden = true;
+      try {
+        const data = await api.post('story/annotate', { source, id: item.id, force }, 600000);
+        item.annotation_status = data.status || 'missing';
+        annotationTag.textContent = ANNOTATION_LABELS[item.annotation_status] || '未标注';
+        annotationTag.className = `tag tag-${item.annotation_status}`;
+        toast('标注完成，可点击“查看标注”查看', 'ok');
+      } catch (err) {
+        annotationError.textContent = `标注失败：${err.message || String(err)}`;
+        annotationError.hidden = false;
+      } finally {
+        annotate.disabled = false;
+        annotate.textContent = 'LLM 标注';
+      }
+    };
+    actions.appendChild(annotate);
+
     if (state.session) {
       const mark = el('button', 'btn btn-sm', item.used ? '标为未出' : '标为已出');
       mark.onclick = async () => {
         await guard(
           api.post('usage/mark', {
-            source: state.source, id: item.id, session: state.session, used: !item.used,
+            source, id: item.id, session: state.session, used: !item.used,
           }),
           '已更新',
         );
@@ -352,6 +393,7 @@
     }
 
     card.appendChild(actions);
+    card.appendChild(annotationError);
     return card;
   }
 
@@ -563,11 +605,14 @@
 
   // ─────────────────────────────────────────── 弹窗
 
-  function openEditor(item) {
+  function openEditor(item, source = state.source) {
+    const version = ++state.editorVersion;
     state.editing = item || null;
+    state.editorSource = !item && currentSource().readonly ? 'custom' : source;
     $('#editorTitle').textContent = item ? '编辑题目' : '新增题目';
     $('#editPuzzle').value = item ? item.puzzle : '';
     $('#editAnswer').value = '';
+    $('#editError').hidden = true;
 
     // 只读题库上的「新增」会落到自定义题库，先说清楚再让人动手写
     const note = $('#editorNote');
@@ -582,37 +627,79 @@
 
     if (item) {
       // 编辑时需要原汤底做初值，这里是明确的编辑意图，直接拉取
-      api.get('story/answer', { source: state.source, id: item.id })
-        .then((data) => { $('#editAnswer').value = data.answer; })
-        .catch((err) => toast(err.message, 'error'));
+      api.get('story/answer', { source, id: item.id })
+        .then((data) => {
+          if (version === state.editorVersion && !$('#editAnswer').value) $('#editAnswer').value = data.answer;
+        })
+        .catch((err) => {
+          if (version !== state.editorVersion) return;
+          $('#editError').textContent = `加载汤底失败：${err.message || String(err)}`;
+          $('#editError').hidden = false;
+        });
     }
   }
 
   async function saveEditor() {
+    const button = $('#editSave');
+    if (button.disabled) return;
     const puzzle = $('#editPuzzle').value.trim();
     const answer = $('#editAnswer').value.trim();
-    if (!puzzle || !answer) return toast('汤面和汤底都不能为空', 'error');
-
-    const target = currentSource().readonly ? 'custom' : state.source;
-    if (state.editing) {
-      await guard(api.post('story/update', {
-        source: state.source, id: state.editing.id, puzzle, answer,
-      }), '已保存');
-    } else {
-      await guard(api.post('story/create', { source: target, puzzle, answer }), '已新增');
-      if (target !== state.source) {
-        state.source = target;
-        renderSourceSeg();
-      }
+    if (!puzzle || !answer) {
+      $('#editError').textContent = '汤面和汤底都不能为空';
+      $('#editError').hidden = false;
+      return;
     }
-    $('#editor').hidden = true;
-    await refreshCurrentTab();
+
+    const source = state.editorSource;
+    const version = state.editorVersion;
+    const editing = state.editing;
+    button.disabled = true;
+    button.textContent = '查重并保存中…';
+    $('#editError').hidden = true;
+    try {
+      const result = await api.post(editing ? 'story/update' : 'story/create', {
+        source, ...(editing ? { id: editing.id } : {}), puzzle, answer,
+      }, 600000);
+      if (version !== state.editorVersion) return;
+      const warnings = Array.isArray(result.warnings) ? result.warnings.join('；') : '';
+      if ($('#editPuzzle').value.trim() !== puzzle || $('#editAnswer').value.trim() !== answer) {
+        if (!editing && result.id) {
+          state.editing = { id: result.id };
+          $('#editorTitle').textContent = '编辑题目';
+        }
+        $('#editError').textContent = '提交时的内容已保存；当前新修改仍保留在编辑器中，尚未保存。'
+          + (warnings ? ` 提示：${warnings}` : '');
+        $('#editError').hidden = false;
+        return;
+      }
+      state.source = source;
+      renderSourceSeg();
+      $('#editor').hidden = true;
+      state.editorVersion++;
+      toast(warnings ? `已保存；提示：${warnings}` : editing ? '已保存' : '已新增', warnings ? 'info' : 'ok');
+      await refreshCurrentTab();
+    } catch (err) {
+      if (version !== state.editorVersion) return;
+      $('#editError').textContent = `未保存：${err.message || String(err)}。输入内容已保留。`;
+      $('#editError').hidden = false;
+    } finally {
+      button.disabled = false;
+      button.textContent = '保存（Ctrl+Enter）';
+    }
   }
 
   async function runGenerate() {
+    if ($('#genRun').disabled) return;
     const count = Math.min(Math.max(parseInt($('#genCount').value, 10) || 1, 1), 5);
+    const theme = $('#genTheme').value === 'custom' ? $('#genCustomTheme').value.trim() : $('#genTheme').value;
+    const ideas = $('#genIdeas').value.trim();
     const box = $('#genResult');
     const btn = $('#genRun');
+    if ($('#genTheme').value === 'custom' && !theme) {
+      box.hidden = false;
+      box.replaceChildren(el('p', 'error-text', '请填写自定义题材，或选择使用配置默认题材。'));
+      return;
+    }
     btn.disabled = true;
     btn.textContent = '生成中…';
     box.hidden = false;
@@ -620,13 +707,16 @@
     box.appendChild(el('p', 'muted', `正在生成 ${count} 道题，LLM 出题较慢，请稍候…`));
     try {
       // 一道题要等 LLM 一轮完整输出，5 道叠起来能远超默认的两分钟
-      const data = await api.post('story/generate', { count }, 600000);
+      const data = await api.post('story/generate', { count, theme, ideas }, 600000);
       box.innerHTML = '';
       (data.created || []).forEach((item) => {
         const row = el('div', 'gen-item');
         row.appendChild(el('span', 'tag tag-used', '已入库'));
         row.appendChild(el('span', null, item.puzzle));
         box.appendChild(row);
+        if (Array.isArray(item.warnings) && item.warnings.length) {
+          box.appendChild(el('p', 'note', `已入库，提示：${item.warnings.join('；')}`));
+        }
       });
       (data.failed || []).forEach((reason) => {
         const row = el('div', 'gen-item');
@@ -647,6 +737,127 @@
     }
   }
 
+  let annotationDetailVersion = 0;
+  const annotationBatch = {
+    timer: null,
+    polling: false,
+    actionBusy: false,
+    previewNeeded: true,
+    preview: null,
+    previewSelection: '',
+    job: null,
+    actionError: '',
+  };
+
+  async function openAnnotation(source, item) {
+    const version = ++annotationDetailVersion;
+    const content = $('#annotationDetailContent');
+    content.replaceChildren(el('p', 'muted', '正在加载标注…'));
+    $('#annotationDetailModal').hidden = false;
+    try {
+      const data = await api.get('story/annotation', { source, id: item.id });
+      if (version !== annotationDetailVersion) return;
+      const annotation = data.annotation;
+      content.replaceChildren();
+      if (data.status === 'stale') {
+        content.appendChild(el('p', 'note', '原标注已失效，请关闭后重新进行 LLM 标注。'));
+        return;
+      }
+      if (!annotation) {
+        content.appendChild(el('p', 'muted', '尚未标注。关闭后可点击“LLM 标注”；查看不会自动调用模型。'));
+        return;
+      }
+      content.appendChild(el('h4', null, '题材'));
+      content.appendChild(el('p', null, annotation.theme || '未提供'));
+      content.appendChild(el('h4', null, '标签'));
+      content.appendChild(el('p', null, annotation.tags?.length ? annotation.tags.join('、') : '未提供'));
+      content.appendChild(el('h4', null, '故事摘要'));
+      content.appendChild(el('p', null, annotation.summary || '未提供'));
+      content.appendChild(el('h4', null, '因果链'));
+      if (annotation.causal_chain?.length) {
+        const chain = el('ol');
+        annotation.causal_chain.forEach((step) => chain.appendChild(el('li', null, step)));
+        content.appendChild(chain);
+      } else content.appendChild(el('p', null, '未提供'));
+      content.appendChild(el('h4', null, '反转'));
+      content.appendChild(el('p', null, annotation.twist || '未提供'));
+    } catch (err) {
+      if (version !== annotationDetailVersion) return;
+      content.replaceChildren(el('p', 'error-text', `加载失败：${err.message || String(err)}`));
+    }
+  }
+
+  function renderAnnotationBatch() {
+    const { job, preview, polling, actionBusy } = annotationBatch;
+    const running = job?.status === 'running';
+    const busy = polling || actionBusy;
+    const selection = JSON.stringify([$('#annotationSource').value, $('#annotationForce').checked]);
+    const previewReady = preview && annotationBatch.previewSelection === selection;
+    if (previewReady) {
+      $('#annotationPreview').textContent = `范围内共 ${preview.total} 题 · 已有有效标注 ${preview.ready} 题 · 本次待标注 ${preview.pending} 题`;
+    } else $('#annotationPreview').textContent = '正在预览所选范围…';
+    $('#annotationSource').disabled = running || actionBusy;
+    $('#annotationForce').disabled = running || actionBusy;
+    $('#annotationPreviewRefresh').disabled = busy;
+    $('#annotationStart').disabled = busy || running || !job || !previewReady || preview.pending <= 0;
+    $('#annotationCancel').disabled = busy || !running;
+    const labels = { idle: '尚未开始', running: '标注进行中', completed: '已完成', cancelled: '已取消', failed: '任务失败' };
+    $('#annotationJobStatus').textContent = job ? labels[job.status] || '任务状态未知' : '正在读取任务状态…';
+    const total = job?.total || 0;
+    const processed = job?.processed || 0;
+    $('#annotationProgress').max = Math.max(total, 1);
+    $('#annotationProgress').value = processed;
+    $('#annotationJobCounts').textContent = job
+      ? `进度 ${processed}/${total} · 成功 ${job.succeeded || 0} · 失败 ${job.failed || 0} · 跳过 ${job.skipped || 0}` : '';
+    const errors = job?.errors || [];
+    const errorList = $('#annotationErrorList');
+    const snapshot = JSON.stringify(errors);
+    if (errorList.dataset.snapshot !== snapshot) {
+      errorList.replaceChildren();
+      errors.forEach((error) => errorList.appendChild(el('li', null,
+        `${error.source || ''}/${error.id || ''}：${error.message || '标注失败'}`)));
+      errorList.dataset.snapshot = snapshot;
+    }
+    $('#annotationErrors').hidden = !errors.length;
+  }
+
+  async function refreshAnnotationBatch() {
+    if ($('#annotationBatchModal').hidden || annotationBatch.polling || annotationBatch.actionBusy) return;
+    clearTimeout(annotationBatch.timer);
+    if (document.hidden) {
+      annotationBatch.timer = setTimeout(refreshAnnotationBatch, 2000);
+      return;
+    }
+    annotationBatch.polling = true;
+    renderAnnotationBatch();
+    try {
+      const previousStatus = annotationBatch.job?.status;
+      const status = await api.get('annotation/status', {});
+      annotationBatch.job = status.job;
+      if (previousStatus !== status.job?.status) annotationBatch.previewNeeded = true;
+      if (annotationBatch.previewNeeded) {
+        const source = $('#annotationSource').value;
+        const force = $('#annotationForce').checked;
+        const selection = JSON.stringify([source, force]);
+        const preview = await api.get('annotation/preview', { source, force: force ? '1' : '0' });
+        if (selection === JSON.stringify([$('#annotationSource').value, $('#annotationForce').checked])) {
+          annotationBatch.preview = preview;
+          annotationBatch.previewSelection = selection;
+          annotationBatch.previewNeeded = false;
+        }
+      }
+      $('#annotationBatchError').textContent = annotationBatch.actionError;
+      $('#annotationBatchError').hidden = !annotationBatch.actionError;
+    } catch (err) {
+      $('#annotationBatchError').textContent = `读取失败：${err.message || String(err)}。可点击“重新预览”重试。`;
+      $('#annotationBatchError').hidden = false;
+    } finally {
+      annotationBatch.polling = false;
+      renderAnnotationBatch();
+      if (!$('#annotationBatchModal').hidden) annotationBatch.timer = setTimeout(refreshAnnotationBatch, 2000);
+    }
+  }
+
   // ─────────────────────────────────────────── 设置
 
   const cfg = {
@@ -654,6 +865,8 @@
     values: {},        // 当前正在编辑的值
     saved: {},         // 最近一次加载/保存成功的快照，用于「撤销修改」
     providers: [],
+    embeddingProviders: [],
+    rerankProviders: [],
     hasKey: false,
     dirty: false,
     revision: 0,
@@ -670,6 +883,8 @@
     if (revision !== cfg.revision) return false;
     cfg.schema = data.schema || {};
     cfg.providers = data.providers || [];
+    cfg.embeddingProviders = data.embedding_providers || [];
+    cfg.rerankProviders = data.rerank_providers || [];
     cfg.hasKey = !!data.has_jev_api_key;
     cfg.values = { ...data.values };
     cfg.saved = { ...data.values };
@@ -709,14 +924,23 @@
 
     let input;
     const isNumeric = meta.type === 'int' || meta.type === 'float';
-    if (meta._special === 'select_provider') {
+    if (['select_provider', 'select_embedding_provider', 'select_rerank_provider'].includes(meta._special)) {
       input = el('select', 'input');
-      input.appendChild(new Option(
-        ['hint_llm_provider', 'verify_llm_provider'].includes(key)
-          ? '（跟随判断问答 LLM）' : '（使用系统默认）',
-        '',
-      ));
-      cfg.providers.forEach((p) => input.appendChild(new Option(providerLabel(p), p.id)));
+      let providers = cfg.providers;
+      let placeholder = ['hint_llm_provider', 'verify_llm_provider'].includes(key)
+        ? '（跟随判断问答 LLM）' : key === 'annotation_llm_provider' ? '（跟随验证 LLM）' : '（使用系统默认）';
+      if (meta._special === 'select_embedding_provider') {
+        providers = cfg.embeddingProviders;
+        placeholder = '（使用文字相似度）';
+      } else if (meta._special === 'select_rerank_provider') {
+        providers = cfg.rerankProviders;
+        placeholder = '（不使用重排）';
+      }
+      input.appendChild(new Option(placeholder, ''));
+      providers.forEach((p) => input.appendChild(new Option(providerLabel(p), p.id)));
+      if (cfg.values[key] && !providers.some((p) => p.id === cfg.values[key])) {
+        input.appendChild(new Option(`${cfg.values[key]}（当前配置，暂不可用）`, cfg.values[key]));
+      }
       input.value = cfg.values[key] || '';
       input.onchange = (e) => setValue(key, e.target.value);
     } else if (meta.options) {
@@ -902,7 +1126,77 @@
   $('#btnCreate').onclick = () => openEditor(null);
   $('#editSave').onclick = saveEditor;
   $('#btnGenerate').onclick = () => { $('#genResult').hidden = true; $('#genModal').hidden = false; };
+  $('#genTheme').onchange = () => { $('#genCustomThemeField').hidden = $('#genTheme').value !== 'custom'; };
   $('#genRun').onclick = runGenerate;
+  $('#btnAnnotateBatch').onclick = () => {
+    $('#annotationSource').replaceChildren(
+      new Option(`当前题库（${currentSource().label || state.source}）`, state.source),
+      new Option('全部题库', 'all'),
+    );
+    annotationBatch.preview = null;
+    annotationBatch.previewNeeded = true;
+    annotationBatch.job = null;
+    $('#annotationBatchModal').hidden = false;
+    refreshAnnotationBatch();
+  };
+  $('#annotationSource').onchange = $('#annotationForce').onchange = () => {
+    annotationBatch.previewNeeded = true;
+    renderAnnotationBatch();
+    refreshAnnotationBatch();
+  };
+  $('#annotationPreviewRefresh').onclick = () => {
+    annotationBatch.preview = null;
+    annotationBatch.previewNeeded = true;
+    annotationBatch.actionError = '';
+    refreshAnnotationBatch();
+  };
+  $('#annotationStart').onclick = async () => {
+    if ($('#annotationStart').disabled) return;
+    annotationBatch.actionBusy = true;
+    annotationBatch.actionError = '';
+    clearTimeout(annotationBatch.timer);
+    renderAnnotationBatch();
+    try {
+      const data = await api.post('annotation/start', {
+        source: $('#annotationSource').value,
+        force: $('#annotationForce').checked,
+      });
+      annotationBatch.job = data.job;
+      annotationBatch.previewNeeded = true;
+      $('#annotationBatchError').hidden = true;
+      toast('批量标注任务已开始', 'ok');
+    } catch (err) {
+      annotationBatch.actionError = `无法开始：${err.message || String(err)}`;
+      $('#annotationBatchError').textContent = annotationBatch.actionError;
+      $('#annotationBatchError').hidden = false;
+    } finally {
+      annotationBatch.actionBusy = false;
+      renderAnnotationBatch();
+      if (!$('#annotationBatchModal').hidden) annotationBatch.timer = setTimeout(refreshAnnotationBatch, 2000);
+    }
+  };
+  $('#annotationCancel').onclick = async () => {
+    if ($('#annotationCancel').disabled) return;
+    annotationBatch.actionBusy = true;
+    annotationBatch.actionError = '';
+    clearTimeout(annotationBatch.timer);
+    renderAnnotationBatch();
+    try {
+      const data = await api.post('annotation/cancel', {});
+      annotationBatch.job = data.job;
+      annotationBatch.previewNeeded = true;
+      $('#annotationBatchError').hidden = true;
+      toast('已请求取消任务', 'ok');
+    } catch (err) {
+      annotationBatch.actionError = `取消失败：${err.message || String(err)}`;
+      $('#annotationBatchError').textContent = annotationBatch.actionError;
+      $('#annotationBatchError').hidden = false;
+    } finally {
+      annotationBatch.actionBusy = false;
+      renderAnnotationBatch();
+      if (!$('#annotationBatchModal').hidden) annotationBatch.timer = setTimeout(refreshAnnotationBatch, 2000);
+    }
+  };
   $('#cfgSave').onclick = saveConfig;
   $('#cfgReset').onclick = resetConfig;
   $('#resetAll').onclick = async () => {
@@ -920,7 +1214,15 @@
   // 关掉确认框必须走 closeConfirm，否则等它的 Promise 永远不落地
   function dismissModal(modal) {
     if (modal.id === 'confirmModal') closeConfirm(false);
-    else modal.hidden = true;
+    else {
+      modal.hidden = true;
+      if (modal.id === 'editor') state.editorVersion++;
+      if (modal.id === 'annotationDetailModal') annotationDetailVersion++;
+      if (modal.id === 'annotationBatchModal') {
+        clearTimeout(annotationBatch.timer);
+        refreshCurrentTab();
+      }
+    }
   }
 
   document.querySelectorAll('[data-close]').forEach((btn) => {
@@ -934,7 +1236,8 @@
     if (e.key === 'Escape') {
       const open = [...document.querySelectorAll('.modal')].filter((m) => !m.hidden);
       // 确认框可能盖在编辑器上面，只关最上面那层
-      if (open.length) dismissModal(open[open.length - 1]);
+      if (!$('#confirmModal').hidden) dismissModal($('#confirmModal'));
+      else if (open.length) dismissModal(open[open.length - 1]);
       return;
     }
     if (e.key === 'Enter') {
@@ -949,7 +1252,13 @@
   refreshCurrentTab();
   const refreshTimer = setInterval(() => refreshCurrentTab({ automatic: true }), 5000);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) refreshCurrentTab({ automatic: true });
+    if (!document.hidden) {
+      refreshCurrentTab({ automatic: true });
+      refreshAnnotationBatch();
+    }
   });
-  window.addEventListener('pagehide', () => clearInterval(refreshTimer));
+  window.addEventListener('pagehide', () => {
+    clearInterval(refreshTimer);
+    clearTimeout(annotationBatch.timer);
+  });
 })();
