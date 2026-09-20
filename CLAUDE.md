@@ -43,6 +43,14 @@ This is an AstrBot plugin, so development involves:
 - **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
   config) or `self._safe_send()` (swallows send failures). Do not call
   `event.send(event.plain_result(...))` directly on paths that end a game.
+- **Jev (optional)**: `judge_question` and `verify_user_guess` try
+  `self._jev_choice()` first — a TypeSafe System One Choice call that can only
+  return one of the keys you pass in. It returns `None` on low confidence,
+  unknown option, or any transport error, and the caller falls back to the LLM.
+  Keep `_JUDGE_CRITERIA` / `_VERIFY_CRITERIA` in step with the wording in the
+  LLM prompts: both paths must classify the same way, or toggling the switch
+  changes how the game feels. `_VERIFY_CRITERIA`'s keys must stay a subset of
+  `_LEVEL_FEEDBACK` and cover every `accept_levels` entry.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 
 ## Important Patterns

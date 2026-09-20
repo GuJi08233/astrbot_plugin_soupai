@@ -62,5 +62,41 @@
     "type": "int",
     "hint": "每局游戏最多可使用多少次 /验证。该限制全程生效，不再只在提问次数用完后才计数。填 0 表示不限次数。",
     "default": 2
+  },
+  "jev_enabled": {
+    "description": "启用 Jev 加速判定",
+    "type": "bool",
+    "hint": "用 TypeSafe 的 Jev 模型做问答判定和推理验证。Jev 只返回预设选项，不会跑题，且响应约 0.7 秒。置信度不足或请求失败时自动回落到上面配置的判断 LLM，因此最差情况与关闭时一致。出题和提示不受影响，仍由 LLM 生成。",
+    "default": false
+  },
+  "jev_api_key": {
+    "description": "Jev API Key",
+    "type": "string",
+    "hint": "TypeSafe API Key。留空则即使开启上面的开关也不会启用。",
+    "default": ""
+  },
+  "jev_base_url": {
+    "description": "Jev API 地址",
+    "type": "string",
+    "hint": "官方为 https://api.typesafe.ai ，使用中转站则填中转地址（需支持原生 /v1/systemone 端点）。",
+    "default": "https://api.typesafe.ai"
+  },
+  "jev_model": {
+    "description": "Jev 模型名",
+    "type": "string",
+    "hint": "默认 jev-latest。可填 jev-preview 或锁定具体版本如 jev-1.13.0。",
+    "default": "jev-latest"
+  },
+  "jev_judge_min_confidence": {
+    "description": "问答判定的最低置信度",
+    "type": "float",
+    "hint": "Jev 判定「是/否/不重要/是也不是」时，置信度低于此值就改用 LLM 判定。判错只影响一次提问，可以设宽松些。填 0 表示始终采信 Jev。",
+    "default": 0.5
+  },
+  "jev_verify_min_confidence": {
+    "description": "推理验证的最低置信度",
+    "type": "float",
+    "hint": "Jev 判定还原等级时，置信度低于此值就改用 LLM 判定。这一步直接决定游戏胜负，建议比上一项更严格。填 0 表示始终采信 Jev。",
+    "default": 0.7
   }
 }
