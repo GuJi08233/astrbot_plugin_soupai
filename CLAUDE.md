@@ -43,14 +43,13 @@ This is an AstrBot plugin, so development involves:
 - **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
   config) or `self._safe_send()` (swallows send failures). Do not call
   `event.send(event.plain_result(...))` directly on paths that end a game.
-- **Jev (optional)**: `judge_question` and `verify_user_guess` try
-  `self._jev_choice()` first — a TypeSafe System One Choice call that can only
-  return one of the keys you pass in. It returns `None` on low confidence,
-  unknown option, or any transport error, and the caller falls back to the LLM.
-  Keep `_JUDGE_CRITERIA` / `_VERIFY_CRITERIA` in step with the wording in the
-  LLM prompts: both paths must classify the same way, or toggling the switch
-  changes how the game feels. `_VERIFY_CRITERIA`'s keys must stay a subset of
-  `_LEVEL_FEEDBACK` and cover every `accept_levels` entry.
+- **Jev (optional, question verdicts only)**: when `judge_engine` is `jev`,
+  `judge_question` tries `self._jev_choice()` first — a TypeSafe System One
+  Choice call that can only return one of the keys you pass in. It returns
+  `None` on low confidence, an unknown option, or any transport error, and the
+  caller falls back to the LLM. Keep `_JUDGE_CRITERIA` in step with the wording
+  in the LLM prompt: both paths must classify the same way, or flipping the
+  setting changes how the game feels.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 
 ## Important Patterns
@@ -81,4 +80,9 @@ This is an AstrBot plugin, so development involves:
   round stays "active" forever and `/汤` can never start a new one.
 - **Never echo the verification LLM's critique on a wrong guess.** To explain
   the mistake it retells the answer. Use the `_LEVEL_FEEDBACK` table instead.
+- **Never route `/验证` through Jev.** It treats state as trusted data, and the
+  player's guess is the one input with an incentive to cheat: submitting the
+  literal text `完全还原` scored 完全还原 at 0.87 confidence and won the round.
+  A Score primitive is fooled the same way. Verdicts are safe — winning a
+  bogus 「是」 does not end the game.
 - Format with `ruff check --fix && ruff format` before committing.

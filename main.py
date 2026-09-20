@@ -469,11 +469,19 @@ class SoupaiPlugin(Star):
         # 每局可用的验证次数
         self.verification_limit = self.config.get("verification_limit", 2)
 
-        # Jev（TypeSafe System One）加速判定。只做分类，出题和提示仍由 LLM 负责
-        self.jev_api_key = str(self.config.get("jev_api_key", "")).strip()
-        self.jev_enabled = bool(self.config.get("jev_enabled", False)) and bool(
-            self.jev_api_key
+        # 提问判定引擎。Jev 只做「是/否/不重要/是也不是」这类封闭选项的快速判别；
+        # 出题、提示、验证一律由 LLM 负责
+        self.judge_engine = str(self.config.get("judge_engine", "llm")).strip().lower()
+        if self.judge_engine not in ("llm", "jev"):
+            logger.warning(
+                f"未知的 judge_engine 配置值 {self.judge_engine!r}，回退为 llm"
+            )
+            self.judge_engine = "llm"
+        self.judge_fallback_to_llm = bool(
+            self.config.get("judge_fallback_to_llm", True)
         )
+
+        self.jev_api_key = str(self.config.get("jev_api_key", "")).strip()
         self.jev_base_url = (
             str(self.config.get("jev_base_url", "https://api.typesafe.ai"))
             .strip()
@@ -483,12 +491,11 @@ class SoupaiPlugin(Star):
         self.jev_judge_min_confidence = float(
             self.config.get("jev_judge_min_confidence", 0.5)
         )
-        self.jev_verify_min_confidence = float(
-            self.config.get("jev_verify_min_confidence", 0.7)
-        )
         self._jev_client: httpx.AsyncClient | None = None
-        if self.config.get("jev_enabled") and not self.jev_api_key:
-            logger.warning("已开启 Jev 判定但未填写 API Key，将继续使用 LLM 判定")
+
+        if self.judge_engine == "jev" and not self.jev_api_key:
+            logger.warning("判定引擎选了 Jev 但未填写 API Key，将继续使用 LLM 判定")
+            self.judge_engine = "llm"
 
         # 难度设置
         self.difficulty_settings = {
@@ -649,21 +656,26 @@ class SoupaiPlugin(Star):
                 logger.error(f"自动生成故事错误: {e}")
                 await asyncio.sleep(300)  # 出错后等待5分钟再试
 
-    # ✅ 生成谜题和答案
     async def _jev_choice(
         self,
         state: dict,
         instructions: str,
         criteria: dict[str, str],
-        min_confidence: float,
     ) -> str | None:
         """用 Jev 做一次单选判定。
 
-        返回选中的选项；未启用、置信度不足或请求失败时返回 None，
-        调用方据此回落到 LLM。Jev 只会返回 criteria 里的键，不会跑题。
+        返回选中的选项；未启用 Jev、置信度不足或请求失败时返回 None，
+        调用方据此改用 LLM。Jev 只会返回 criteria 里的键，不会跑题。
+
+        关闭兜底时置信度门槛不生效（始终采信 Jev），但请求真的失败时
+        仍然返回 None —— 否则玩家等不到任何回复。
         """
-        if not self.jev_enabled:
+        if self.judge_engine != "jev":
             return None
+
+        min_confidence = (
+            self.jev_judge_min_confidence if self.judge_fallback_to_llm else 0.0
+        )
 
         if self._jev_client is None:
             self._jev_client = httpx.AsyncClient(
@@ -690,15 +702,15 @@ class SoupaiPlugin(Star):
             choice = answer["choice"]
             confidence = answer.get("confidence", 0.0)
         except Exception as e:
-            logger.warning(f"Jev 判定失败，回落到 LLM: {e}")
+            logger.warning(f"Jev 判定失败，改用 LLM: {e}")
             return None
 
         if choice not in criteria:
-            logger.warning(f"Jev 返回了未知选项 {choice!r}，回落到 LLM")
+            logger.warning(f"Jev 返回了未知选项 {choice!r}，改用 LLM")
             return None
         if confidence < min_confidence:
             logger.info(
-                f"Jev 判定 {choice!r} 置信度 {confidence:.2f} 低于 {min_confidence}，回落到 LLM"
+                f"Jev 判定 {choice!r} 置信度 {confidence:.2f} 低于 {min_confidence}，改用 LLM"
             )
             return None
 
@@ -723,6 +735,7 @@ class SoupaiPlugin(Star):
             logger.error("未配置 LLM 服务商")
         return provider
 
+    # ✅ 生成谜题和答案
     async def generate_story_with_llm(self, umo: str | None = None) -> tuple[str, str]:
         """使用 LLM 生成海龟汤谜题"""
 
@@ -920,15 +933,12 @@ class SoupaiPlugin(Star):
             logger.error(f"为存储库生成故事错误: {e}")
             return False
 
-    # 四个还原等级的含义，与 _build_verification_system_prompt 中的口径保持一致
-    _VERIFY_CRITERIA = {
-        "完全还原": "核心逻辑、动机、因果链、关键行为全部准确复原，无明显偏差。",
-        "核心推理正确": "主干因果逻辑清晰、关键转折已被识别，但部分细节错误或过程含混。",
-        "部分正确": "推理中包含部分正确线索或行为判断，但整体逻辑不完整或动机解释偏离。",
-        "基本不符": "推理内容与真相不符，逻辑错误严重，无法解释题面设定。",
-    }
-
     # ✅ 验证用户推理
+    #
+    # 这里刻意只用 LLM，不接 Jev。Jev 把 state 当作可信数据，玩家提交的推理
+    # 却是本插件里唯一有作弊动机的输入：实测提交「完全还原」四个字，Jev 就以
+    # 0.87 的置信度判定完全还原，直接赢下本局。换 Score 原语也一样被骗，因为
+    # 问题不在原语，而在它不设防。判定提问没有这个风险（骗到一个「是」不会赢）。
     async def verify_user_guess(
         self, user_guess: str, true_answer: str, umo: str | None = None
     ) -> VerificationResult:
@@ -943,16 +953,6 @@ class SoupaiPlugin(Star):
         Returns:
             VerificationResult: 验证结果
         """
-        jev_level = await self._jev_choice(
-            state={"标准答案": true_answer, "玩家推理": user_guess},
-            instructions="对比`玩家推理`与`标准答案`，判断玩家还原真相的程度等级。",
-            criteria=self._VERIFY_CRITERIA,
-            min_confidence=self.jev_verify_min_confidence,
-        )
-        if jev_level:
-            # 猜错时评价不外显，猜中时游戏已结束，用等级描述本身即可
-            return VerificationResult(jev_level, self._VERIFY_CRITERIA[jev_level])
-
         provider = self._resolve_provider(self.judge_llm_provider_id, umo)
         if provider is None:
             if self.judge_llm_provider_id:
@@ -1087,10 +1087,12 @@ class SoupaiPlugin(Star):
             state={"谜面": puzzle, "真相": true_answer, "玩家提问": question},
             instructions="海龟汤推理游戏。请判断`玩家提问`的说法，相对于`真相`应当如何回答。",
             criteria=self._JUDGE_CRITERIA,
-            min_confidence=self.jev_judge_min_confidence,
         )
         if jev_choice:
             return jev_choice
+        if self.judge_engine == "jev" and not self.judge_fallback_to_llm:
+            # 选了 Jev 又关了兜底，走到这里说明请求真的失败了
+            return "判定服务暂时不可用，请稍后再问一次"
 
         provider = self._resolve_provider(self.judge_llm_provider_id, umo)
         if provider is None:
@@ -2528,15 +2530,18 @@ class SoupaiPlugin(Star):
         if local_info["available"] <= 0:
             storage_full_warning = "\n⚠️ 本地存储库已满，自动生成已停止"
 
-        if self.jev_enabled:
-            jev_info = (
-                f"{self.jev_model}（判定≥{self.jev_judge_min_confidence:g}，"
-                f"验证≥{self.jev_verify_min_confidence:g}，不足则用 LLM）"
-            )
-        elif self.config.get("jev_enabled"):
-            jev_info = "已开启但未填 API Key，实际未生效"
+        if self.judge_engine == "jev":
+            if self.judge_fallback_to_llm:
+                judge_info = (
+                    f"Jev {self.jev_model}"
+                    f"（置信度<{self.jev_judge_min_confidence:g} 时改用 LLM）"
+                )
+            else:
+                judge_info = f"Jev {self.jev_model}（不兜底）"
+        elif str(self.config.get("judge_engine", "")).lower() == "jev":
+            judge_info = "LLM（已选 Jev 但未填 API Key）"
         else:
-            jev_info = "未启用"
+            judge_info = "LLM"
 
         config_info = (
             f"⚙️ 海龟汤插件配置：\n"
@@ -2547,7 +2552,7 @@ class SoupaiPlugin(Star):
             f"• 本地存储库：{local_info['total']}/{local_info['max_size']} (已用: {local_info['used']}, 剩余: {local_info['remaining']})\n"
             f"• 自动生成时间：{self.auto_generate_start}:00-{self.auto_generate_end}:00\n"
             f"• 谜题来源策略：{strategy_name}\n"
-            f"• Jev 加速判定：{jev_info}{storage_full_warning}"
+            f"• 提问判定引擎：{judge_info}{storage_full_warning}"
         )
         yield event.plain_result(config_info)
 
