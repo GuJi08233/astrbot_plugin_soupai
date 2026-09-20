@@ -1,22 +1,22 @@
-import json
 import asyncio
+import json
 import os
 import threading
-from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Tuple, List
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, StarTools
+from pathlib import Path
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.message_components import At, Reply
 from astrbot.api.provider import LLMResponse
-from astrbot.api import logger, AstrBotConfig
+from astrbot.api.star import Context, Star, StarTools
 
 # SessionFilter 尚未在 astrbot.api.util 中导出，只能从 core 导入
 from astrbot.core.utils.session_waiter import (
-    session_waiter,
     SessionController,
     SessionFilter,
+    session_waiter,
 )
-from astrbot.api.message_components import At, Reply
 
 
 # 线程安全的题库管理基类
@@ -41,16 +41,14 @@ class ThreadSafeStoryStorage:
 
         try:
             if self.usage_file.exists():
-                with open(self.usage_file, "r", encoding="utf-8") as f:
+                with open(self.usage_file, encoding="utf-8") as f:
                     self.used_indexes = set(json.load(f))
                 logger.info(
                     f"从 {self.usage_file} 加载了 {len(self.used_indexes)} 个使用记录"
                 )
             else:
                 self.used_indexes = set()
-                logger.info(
-                    f"使用记录文件不存在，创建新的记录: {self.usage_file}"
-                )
+                logger.info(f"使用记录文件不存在，创建新的记录: {self.usage_file}")
         except Exception as e:
             logger.error(f"加载使用记录失败: {e}")
             self.used_indexes = set()
@@ -77,7 +75,7 @@ class ThreadSafeStoryStorage:
             self.save_usage_record()
             logger.info(f"{self.storage_name} 使用记录已重置")
 
-    def get_usage_info(self) -> Dict:
+    def get_usage_info(self) -> dict:
         """获取使用记录信息"""
         with self.lock:
             return {
@@ -89,7 +87,7 @@ class ThreadSafeStoryStorage:
 # 游戏状态管理
 class GameState:
     def __init__(self):
-        self.active_games: Dict[str, Dict] = {}  # 群聊ID -> 游戏状态
+        self.active_games: dict[str, dict] = {}  # 群聊ID -> 游戏状态
 
     def start_game(self, group_id: str, puzzle: str, answer: str, **extra) -> bool:
         """开始游戏，返回是否成功"""
@@ -113,7 +111,7 @@ class GameState:
             return True
         return False
 
-    def get_game(self, group_id: str) -> Optional[Dict]:
+    def get_game(self, group_id: str) -> dict | None:
         """获取游戏状态"""
         return self.active_games.get(group_id)
 
@@ -128,14 +126,14 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
         # 初始化基类
         super().__init__("network_soupai", data_path)
         self.network_file = network_file
-        self.stories: List[Dict] = []
+        self.stories: list[dict] = []
         self.load_stories()
 
     def load_stories(self):
         """从文件加载网络海龟汤故事"""
         try:
             if os.path.exists(self.network_file):
-                with open(self.network_file, "r", encoding="utf-8") as f:
+                with open(self.network_file, encoding="utf-8") as f:
                     self.stories = json.load(f)
                 logger.info(
                     f"从 {self.network_file} 加载了 {len(self.stories)} 个网络海龟汤故事"
@@ -147,7 +145,7 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
             logger.error(f"加载网络海龟汤失败: {e}")
             self.stories = []
 
-    def get_story(self) -> Optional[Tuple[str, str]]:
+    def get_story(self) -> tuple[str, str] | None:
         """从网络题库获取一个故事，避免重复（线程安全）"""
         if not self.stories:
             return None
@@ -181,7 +179,7 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
             )
             return story["puzzle"], story["answer"]
 
-    def get_storage_info(self) -> Dict:
+    def get_storage_info(self) -> dict:
         """获取网络题库信息"""
         usage_info = self.get_usage_info()
         return {
@@ -198,7 +196,7 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
         super().__init__("storage_soupai", data_path)
         self.storage_file = storage_file
         self.max_size = max_size
-        self.stories: List[Dict] = []
+        self.stories: list[dict] = []
         self.load_stories()
 
     def load_stories(self):
@@ -210,7 +208,7 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
                 else str(self.storage_file)
             )
             if os.path.exists(storage_path):
-                with open(storage_path, "r", encoding="utf-8") as f:
+                with open(storage_path, encoding="utf-8") as f:
                     self.stories = json.load(f)
                 logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个故事")
             else:
@@ -254,7 +252,7 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
             logger.info(f"添加新故事到存储库，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self) -> Optional[Tuple[str, str]]:
+    def get_story(self) -> tuple[str, str] | None:
         """从存储库获取一个故事，避免重复（线程安全）"""
         if not self.stories:
             return None
@@ -288,7 +286,7 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
             )
             return story["puzzle"], story["answer"]
 
-    def get_storage_info(self) -> Dict:
+    def get_storage_info(self) -> dict:
         """获取存储库信息"""
         usage_info = self.get_usage_info()
         return {
@@ -306,7 +304,7 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
         # 初始化基类
         super().__init__("custom_soupai", data_path)
         self.storage_file = storage_file
-        self.stories: List[Dict] = []
+        self.stories: list[dict] = []
         self.load_stories()
 
     def load_stories(self):
@@ -318,9 +316,11 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
                 else str(self.storage_file)
             )
             if os.path.exists(storage_path):
-                with open(storage_path, "r", encoding="utf-8") as f:
+                with open(storage_path, encoding="utf-8") as f:
                     self.stories = json.load(f)
-                logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个自定义海龟汤故事")
+                logger.info(
+                    f"从 {storage_path} 加载了 {len(self.stories)} 个自定义海龟汤故事"
+                )
             else:
                 self.stories = []
                 logger.info("自定义海龟汤文件不存在，创建新的存储库")
@@ -340,7 +340,9 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             os.makedirs(os.path.dirname(storage_path), exist_ok=True)
             with open(storage_path, "w", encoding="utf-8") as f:
                 json.dump(self.stories, f, ensure_ascii=False, indent=2)
-            logger.info(f"保存了 {len(self.stories)} 个自定义海龟汤故事到 {storage_path}")
+            logger.info(
+                f"保存了 {len(self.stories)} 个自定义海龟汤故事到 {storage_path}"
+            )
         except Exception as e:
             logger.error(f"保存自定义海龟汤失败: {e}")
 
@@ -357,7 +359,7 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             logger.info(f"添加新自定义海龟汤故事，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self) -> Optional[Tuple[str, str]]:
+    def get_story(self) -> tuple[str, str] | None:
         """从自定义存储库获取一个故事，避免重复（线程安全）"""
         if not self.stories:
             return None
@@ -391,7 +393,7 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             )
             return story["puzzle"], story["answer"]
 
-    def get_storage_info(self) -> Dict:
+    def get_storage_info(self) -> dict:
         """获取自定义存储库信息"""
         usage_info = self.get_usage_info()
         return {
@@ -410,7 +412,7 @@ class VerificationResult:
         self.comment = comment
         self.is_correct = is_correct
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         return {
             "level": self.level,
             "comment": self.comment,
@@ -457,7 +459,9 @@ class SoupaiPlugin(Star):
         # 回复方式：quote=引用提问者原消息，direct=直接回复
         self.reply_mode = self.config.get("reply_mode", "quote")
         if self.reply_mode not in ("quote", "direct"):
-            logger.warning(f"未知的 reply_mode 配置值 {self.reply_mode!r}，回退为 quote")
+            logger.warning(
+                f"未知的 reply_mode 配置值 {self.reply_mode!r}，回退为 quote"
+            )
             self.reply_mode = "quote"
 
         # 每局可用的验证次数
@@ -486,7 +490,7 @@ class SoupaiPlugin(Star):
                 "hint_limit": 0,
             },
         }
-        self.group_difficulty: Dict[str, str] = {}
+        self.group_difficulty: dict[str, str] = {}
 
         # 数据存储路径: 使用框架提供的工具获取插件数据目录
         self.data_path = StarTools.get_data_dir()
@@ -528,9 +532,7 @@ class SoupaiPlugin(Star):
 
         if self.custom_story_storage is None:
             custom_file = self.data_path / "custom_soupai.json"
-            self.custom_story_storage = CustomSoupaiStorage(
-                custom_file, self.data_path
-            )
+            self.custom_story_storage = CustomSoupaiStorage(custom_file, self.data_path)
 
     async def init(self, context: Context):
         """插件初始化，此时 self.data_path 可用"""
@@ -622,7 +624,7 @@ class SoupaiPlugin(Star):
                 await asyncio.sleep(300)  # 出错后等待5分钟再试
 
     # ✅ 生成谜题和答案
-    def _resolve_provider(self, provider_id: str, umo: Optional[str] = None):
+    def _resolve_provider(self, provider_id: str, umo: str | None = None):
         """解析要使用的 LLM 提供商，未找到时返回 None 并记录日志。
 
         Args:
@@ -640,7 +642,7 @@ class SoupaiPlugin(Star):
             logger.error("未配置 LLM 服务商")
         return provider
 
-    async def generate_story_with_llm(self, umo: Optional[str] = None) -> Tuple[str, str]:
+    async def generate_story_with_llm(self, umo: str | None = None) -> tuple[str, str]:
         """使用 LLM 生成海龟汤谜题"""
 
         provider = self._resolve_provider(self.generate_llm_provider_id, umo)
@@ -839,7 +841,7 @@ class SoupaiPlugin(Star):
 
     # ✅ 验证用户推理
     async def verify_user_guess(
-            self, user_guess: str, true_answer: str, umo: Optional[str] = None
+        self, user_guess: str, true_answer: str, umo: str | None = None
     ) -> VerificationResult:
         """
         验证用户推理
@@ -965,7 +967,7 @@ class SoupaiPlugin(Star):
 
     # ✅ 判断提问的回答方式
     async def judge_question(
-            self, question: str, true_answer: str, umo: Optional[str] = None
+        self, question: str, true_answer: str, umo: str | None = None
     ) -> str:
         """使用 LLM 判断用户提问的回答方式"""
 
@@ -980,24 +982,24 @@ class SoupaiPlugin(Star):
             f"1. 故事的完整真相是：{true_answer}\n"
             f'2. 玩家提问或陈述："{question}"\n'
             f"3. 你的任务是判断玩家的说法是否符合真相。\n"
-            f"4. 只能回答：\"是\"、\"否\"、\"不重要\"或\"是也不是\"。\n\n"
+            f'4. 只能回答："是"、"否"、"不重要"或"是也不是"。\n\n'
             f"判定标准：\n"
-            f"- \"是\"：\n"
-            f"  玩家命中关键事实或行为，且该信息能直接帮助接近真相。缺少部分细节可以忽略，只要不影响推理方向，就判\"是\"。\n"
-            f"- \"否\"：\n"
+            f'- "是"：\n'
+            f'  玩家命中关键事实或行为，且该信息能直接帮助接近真相。缺少部分细节可以忽略，只要不影响推理方向，就判"是"。\n'
+            f'- "否"：\n'
             f"  与真相完全不符，或包含明显错误，会使玩家推理走向错误方向。\n"
-            f"- \"不重要\"：\n"
+            f'- "不重要"：\n'
             f"  与故事真相无关，或该信息无法推动推理进展。\n"
-            f"- \"是也不是\"：\n"
+            f'- "是也不是"：\n'
             f"  玩家命中部分事实，但：\n"
             f"    1) 因果关系不完整或存在偏差；\n"
             f"    2) 表述中包含可能让玩家推理错误的成分；\n"
             f"    3) 忽略了与当前描述直接相关的重要关键点。\n"
-            f"  如果只是缺少背景信息，但不影响方向，优先判\"是\"而不是\"是也不是\"。\n\n"
+            f'  如果只是缺少背景信息，但不影响方向，优先判"是"而不是"是也不是"。\n\n'
             f"额外说明：\n"
             f"- 不要求玩家一次性说出全部真相。\n"
-            f"- 允许玩家只描述真相的一部分，只要方向正确且不会误导，就判\"是\"。\n"
-            f"- 对可能误导玩家的陈述要谨慎，宁可判\"是也不是\"。\n"
+            f'- 允许玩家只描述真相的一部分，只要方向正确且不会误导，就判"是"。\n'
+            f'- 对可能误导玩家的陈述要谨慎，宁可判"是也不是"。\n'
             f"- 判定时平衡游戏流畅性和推理挑战性。"
         )
 
@@ -1021,7 +1023,9 @@ class SoupaiPlugin(Star):
             return "（判断失败，请重试）"
 
     # ✅ 生成方向性提示
-    def build_allow_list(self, puzzle: str, qa_history: List[Dict[str, str]]) -> List[str]:
+    def build_allow_list(
+        self, puzzle: str, qa_history: list[dict[str, str]]
+    ) -> list[str]:
         """根据题面和历史问答构建允许在提示中出现的名词列表"""
         import re
 
@@ -1034,7 +1038,7 @@ class SoupaiPlugin(Star):
         # 提取连续的中文、字母或数字片段作为候选名词
         tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text)
 
-        allow: List[str] = []
+        allow: list[str] = []
         for token in tokens:
             if not token:
                 continue
@@ -1047,13 +1051,13 @@ class SoupaiPlugin(Star):
         return allow
 
     async def generate_hint(
-            self,
-            puzzle: str,
-            true_answer: str,
-            qa_history: List[Dict[str, str]],
-            hint_history: List[str],
-            allow_list: List[str],
-            umo: Optional[str] = None,
+        self,
+        puzzle: str,
+        true_answer: str,
+        qa_history: list[dict[str, str]],
+        hint_history: list[str],
+        allow_list: list[str],
+        umo: str | None = None,
     ) -> str:
         """根据本局已记录的问答与提示生成新的方向性提示"""
         provider = self._resolve_provider(self.judge_llm_provider_id, umo)
@@ -1068,7 +1072,7 @@ class SoupaiPlugin(Star):
         hint_text = "\n".join(hint_history) if hint_history else "（无）"
         allow_text = ", ".join(allow_list) if allow_list else "（无）"
         prompt = (
-            "你是\"海龟汤\"提示生成器。你知道完整真相（仅供内部推理，严禁外泄）。\n"
+            '你是"海龟汤"提示生成器。你知道完整真相（仅供内部推理，严禁外泄）。\n'
             "材料：\n\n"
             f"* 题面：{puzzle}\n"
             f"* 完整真相（不可外泄）：{true_answer}\n"
@@ -1095,7 +1099,7 @@ class SoupaiPlugin(Star):
             )
             text = llm_resp.completion_text.strip()
             if text.startswith("提示："):
-                text = text[len("提示："):]
+                text = text[len("提示：") :]
             return text
         except Exception as e:
             logger.error(f"生成提示失败: {e}")
@@ -1123,13 +1127,13 @@ class SoupaiPlugin(Star):
     @filter.command("汤")
     async def start_soupai_game(self, event: AstrMessageEvent):
         """开始海龟汤游戏
-        
+
         使用格式: /汤 [题库类型] [题号]
-        
+
         参数说明:
         - 题库类型 (可选): network(网络题库), storage(本地存储库), custom(自定义题库)
         - 题号 (可选): 指定题库中的题目索引，从0开始
-        
+
         示例:
         /汤                    # 使用配置的策略随机获取谜题
         /汤 network           # 从网络题库随机获取谜题
@@ -1167,20 +1171,20 @@ class SoupaiPlugin(Star):
             # 解析命令参数
             message_content = event.message_str.strip()
             args = message_content.split()[1:]  # 去掉命令本身
-            
+
             story = None
             source_type = None
             puzzle_index = None
-            
+
             # 解析参数格式: /汤 <network|storage|custom> <题号>
             # 两个参数都是可选的
             if len(args) >= 1:
                 first_arg = args[0].lower()
-                
+
                 # 检查第一个参数是否是题库类型
                 if first_arg in ["network", "local", "custom"]:
                     source_type = first_arg
-                    
+
                     # 检查是否有第二个参数（题号）
                     if len(args) >= 2:
                         try:
@@ -1209,13 +1213,15 @@ class SoupaiPlugin(Star):
             else:
                 # 没有参数，使用配置的策略随机获取
                 source_type = "current"
-            
+
             # 根据解析的参数获取故事
             if puzzle_index is not None:
                 # 指定了题号，从特定题库获取
                 story = await self.get_story_by_index(source_type, puzzle_index)
                 if not story:
-                    yield event.plain_result(f"{source_type}题库中没有第 {puzzle_index} 号题目")
+                    yield event.plain_result(
+                        f"{source_type}题库中没有第 {puzzle_index} 号题目"
+                    )
                     self.generating_games.discard(group_id)
                     return
             else:
@@ -1233,10 +1239,11 @@ class SoupaiPlugin(Star):
                     elif source_type == "custom":
                         story = self.custom_story_storage.get_story()
                     else:
-                        yield event.plain_result("题库类型参数错误，请使用 network/local/custom")
+                        yield event.plain_result(
+                            "题库类型参数错误，请使用 network/local/custom"
+                        )
                         self.generating_games.discard(group_id)
                         return
-
 
             if not story:
                 yield event.plain_result("获取谜题失败，请重试")
@@ -1251,23 +1258,22 @@ class SoupaiPlugin(Star):
                 self.generating_games.discard(group_id)
                 return
 
-
             difficulty = self.group_difficulty.get(group_id, "普通")
             diff_conf = self.difficulty_settings.get(
                 difficulty, self.difficulty_settings["普通"]
             )
 
             if self.game_state.start_game(
-                    group_id,
-                    puzzle,
-                    answer,
-                    difficulty=difficulty,
-                    question_limit=diff_conf["limit"],
-                    question_count=0,
-                    verification_attempts=0,
-                    accept_levels=diff_conf["accept_levels"],
-                    hint_limit=diff_conf.get("hint_limit"),
-                    hint_count=0,
+                group_id,
+                puzzle,
+                answer,
+                difficulty=difficulty,
+                question_limit=diff_conf["limit"],
+                question_count=0,
+                verification_attempts=0,
+                accept_levels=diff_conf["accept_levels"],
+                hint_limit=diff_conf.get("hint_limit"),
+                hint_count=0,
             ):
                 extra = ""
                 if diff_conf["limit"] is not None:
@@ -1339,14 +1345,14 @@ class SoupaiPlugin(Star):
 
     # 🎯 游戏会话控制
     async def _start_game_session(
-            self, event: AstrMessageEvent, group_id: str, answer: str
+        self, event: AstrMessageEvent, group_id: str, answer: str
     ):
         """启动游戏会话控制"""
         try:
 
             @session_waiter(timeout=self.game_timeout, record_history_chains=False)
             async def game_session_waiter(
-                    controller: SessionController, event: AstrMessageEvent
+                controller: SessionController, event: AstrMessageEvent
             ):
                 try:
                     # 从游戏状态获取答案，确保变量可用
@@ -1374,7 +1380,6 @@ class SoupaiPlugin(Star):
                         controller.keep(timeout=self.game_timeout, reset_timeout=True)
                         return
                     if user_input in ("/提示", "提示"):
-
                         async for result in self.hint_command(event):
                             await event.send(result)
                         controller.keep(timeout=self.game_timeout, reset_timeout=True)
@@ -1455,7 +1460,6 @@ class SoupaiPlugin(Star):
                         )
                         return
 
-
                     # 处理游戏问答消息
                     command_part = user_input.strip()  # 直接使用 plain_text
                     logger.info(f"处理游戏问答消息: '{command_part}'")
@@ -1503,7 +1507,9 @@ class SoupaiPlugin(Star):
 
             try:
                 # 使用群 ID 限制会话范围，避免多个群并发时互相触发
-                await game_session_waiter(event, session_filter=GroupSessionFilter(group_id))
+                await game_session_waiter(
+                    event, session_filter=GroupSessionFilter(group_id)
+                )
             except TimeoutError:
                 game = self.game_state.get_game(group_id)
                 if game:
@@ -1551,7 +1557,7 @@ class SoupaiPlugin(Star):
         """在会话中发送一条引用提问者的回复。"""
         await event.send(self._reply_result(event, text))
 
-    def _format_game_status(self, game: Dict) -> str:
+    def _format_game_status(self, game: dict) -> str:
         """构建游戏状态文本，供 /汤状态 指令与会话内查询共用。"""
         question_count = game.get("question_count", 0)
         question_limit = game.get("question_limit")
@@ -1578,7 +1584,7 @@ class SoupaiPlugin(Star):
             lines.append(f"🔍 验证：{used}/{self.verification_limit}")
         return "\n".join(lines)
 
-    def _verification_quota_text(self, game: Optional[Dict]) -> str:
+    def _verification_quota_text(self, game: dict | None) -> str:
         """描述本局还剩多少次验证机会。"""
         if self.verification_limit <= 0:
             return "验证次数不限。"
@@ -1608,7 +1614,7 @@ class SoupaiPlugin(Star):
                 return True
         return False
 
-    async def get_story_by_strategy(self, strategy: str) -> Optional[Tuple[str, str]]:
+    async def get_story_by_strategy(self, strategy: str) -> tuple[str, str] | None:
         """根据策略获取故事，返回 (puzzle, answer) 或 None"""
         import random
 
@@ -1730,50 +1736,52 @@ class SoupaiPlugin(Star):
 
         return None
 
-    async def get_story_by_index(self, source_type: str, index: int) -> Optional[Tuple[str, str]]:
+    async def get_story_by_index(
+        self, source_type: str, index: int
+    ) -> tuple[str, str] | None:
         """根据索引获取特定故事
-        
+
         Args:
             source_type: "network" - 网络题库, "current" - 当前策略题库, "custom" - 自定义题库
             index: 题目索引（从0开始）
-        
+
         Returns:
             (puzzle, answer) 或 None
         """
         self._ensure_story_storages()
-        
+
         if source_type == "network":
             # 从网络题库获取指定索引的故事
             if index < 0 or index >= len(self.online_story_storage.stories):
                 return None
-            
+
             story = self.online_story_storage.stories[index]
             # 标记为已使用
             with self.online_story_storage.lock:
                 self.online_story_storage.used_indexes.add(index)
                 self.online_story_storage.save_usage_record()
-            
+
             logger.info(f"从网络题库获取指定故事，索引: {index}")
             return story["puzzle"], story["answer"]
-            
+
         elif source_type == "custom":
             # 从自定义题库获取指定索引的故事
             if index < 0 or index >= len(self.custom_story_storage.stories):
                 return None
-            
+
             story = self.custom_story_storage.stories[index]
             # 标记为已使用
             with self.custom_story_storage.lock:
                 self.custom_story_storage.used_indexes.add(index)
                 self.custom_story_storage.save_usage_record()
-            
+
             logger.info(f"从自定义题库获取指定故事，索引: {index}")
             return story["puzzle"], story["answer"]
-            
+
         elif source_type == "current":
             # 根据当前策略获取指定索引的故事
             strategy = self.puzzle_source_strategy
-            
+
             if strategy == "network_first":
                 # 优先检查网络题库
                 if index < len(self.online_story_storage.stories):
@@ -1783,30 +1791,34 @@ class SoupaiPlugin(Star):
                         self.online_story_storage.save_usage_record()
                     logger.info(f"从网络题库获取指定故事，索引: {index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查本地存储库
                 local_index = index - len(self.online_story_storage.stories)
-                if local_index >= 0 and local_index < len(self.local_story_storage.stories):
+                if local_index >= 0 and local_index < len(
+                    self.local_story_storage.stories
+                ):
                     story = self.local_story_storage.stories[local_index]
                     with self.local_story_storage.lock:
                         self.local_story_storage.used_indexes.add(local_index)
                         self.local_story_storage.save_usage_record()
                     logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查自定义题库
                 custom_index = local_index - len(self.local_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(self.custom_story_storage.stories):
+                if custom_index >= 0 and custom_index < len(
+                    self.custom_story_storage.stories
+                ):
                     story = self.custom_story_storage.stories[custom_index]
                     with self.custom_story_storage.lock:
                         self.custom_story_storage.used_indexes.add(custom_index)
                         self.custom_story_storage.save_usage_record()
                     logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 超出范围，返回None
                 return None
-                
+
             elif strategy == "local_first":
                 # 优先检查本地存储库
                 if index < len(self.local_story_storage.stories):
@@ -1816,30 +1828,34 @@ class SoupaiPlugin(Star):
                         self.local_story_storage.save_usage_record()
                     logger.info(f"从本地存储库获取指定故事，索引: {index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查网络题库
                 network_index = index - len(self.local_story_storage.stories)
-                if network_index >= 0 and network_index < len(self.online_story_storage.stories):
+                if network_index >= 0 and network_index < len(
+                    self.online_story_storage.stories
+                ):
                     story = self.online_story_storage.stories[network_index]
                     with self.online_story_storage.lock:
                         self.online_story_storage.used_indexes.add(network_index)
                         self.online_story_storage.save_usage_record()
                     logger.info(f"从网络题库获取指定故事，索引: {network_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查自定义题库
                 custom_index = network_index - len(self.online_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(self.custom_story_storage.stories):
+                if custom_index >= 0 and custom_index < len(
+                    self.custom_story_storage.stories
+                ):
                     story = self.custom_story_storage.stories[custom_index]
                     with self.custom_story_storage.lock:
                         self.custom_story_storage.used_indexes.add(custom_index)
                         self.custom_story_storage.save_usage_record()
                     logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 超出范围，返回None
                 return None
-                
+
             elif strategy == "custom_first":
                 # 优先检查自定义题库
                 if index < len(self.custom_story_storage.stories):
@@ -1849,30 +1865,34 @@ class SoupaiPlugin(Star):
                         self.custom_story_storage.save_usage_record()
                     logger.info(f"从自定义题库获取指定故事，索引: {index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查本地存储库
                 local_index = index - len(self.custom_story_storage.stories)
-                if local_index >= 0 and local_index < len(self.local_story_storage.stories):
+                if local_index >= 0 and local_index < len(
+                    self.local_story_storage.stories
+                ):
                     story = self.local_story_storage.stories[local_index]
                     with self.local_story_storage.lock:
                         self.local_story_storage.used_indexes.add(local_index)
                         self.local_story_storage.save_usage_record()
                     logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 然后检查网络题库
                 network_index = local_index - len(self.local_story_storage.stories)
-                if network_index >= 0 and network_index < len(self.online_story_storage.stories):
+                if network_index >= 0 and network_index < len(
+                    self.online_story_storage.stories
+                ):
                     story = self.online_story_storage.stories[network_index]
                     with self.online_story_storage.lock:
                         self.online_story_storage.used_indexes.add(network_index)
                         self.online_story_storage.save_usage_record()
                     logger.info(f"从网络题库获取指定故事，索引: {network_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 超出范围，返回None
                 return None
-                
+
             elif strategy == "random":
                 # 对于随机策略，我们无法准确知道索引对应哪个题库
                 # 这里我们按顺序检查：先网络题库，再本地存储库，最后自定义题库
@@ -1883,36 +1903,39 @@ class SoupaiPlugin(Star):
                         self.online_story_storage.save_usage_record()
                     logger.info(f"从网络题库获取指定故事，索引: {index}")
                     return story["puzzle"], story["answer"]
-                
+
                 local_index = index - len(self.online_story_storage.stories)
-                if local_index >= 0 and local_index < len(self.local_story_storage.stories):
+                if local_index >= 0 and local_index < len(
+                    self.local_story_storage.stories
+                ):
                     story = self.local_story_storage.stories[local_index]
                     with self.local_story_storage.lock:
                         self.local_story_storage.used_indexes.add(local_index)
                         self.local_story_storage.save_usage_record()
                     logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 custom_index = local_index - len(self.local_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(self.custom_story_storage.stories):
+                if custom_index >= 0 and custom_index < len(
+                    self.custom_story_storage.stories
+                ):
                     story = self.custom_story_storage.stories[custom_index]
                     with self.custom_story_storage.lock:
                         self.custom_story_storage.used_indexes.add(custom_index)
                         self.custom_story_storage.save_usage_record()
                     logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
                     return story["puzzle"], story["answer"]
-                
+
                 # 超出范围，返回None
                 return None
-        
+
         return None
 
     async def _handle_game_status_in_session(
-            self, event: AstrMessageEvent, group_id: str
+        self, event: AstrMessageEvent, group_id: str
     ):
         """在会话控制中处理游戏状态查询逻辑"""
         try:
-
             if self.game_state.is_game_active(group_id):
                 game = self.game_state.get_game(group_id)
                 await event.send(event.plain_result(self._format_game_status(game)))
@@ -1928,11 +1951,10 @@ class SoupaiPlugin(Star):
             await event.send(event.plain_result(f"查询游戏状态时发生错误：{e}"))
 
     async def _handle_force_end_in_session(
-            self, event: AstrMessageEvent, group_id: str
+        self, event: AstrMessageEvent, group_id: str
     ):
         """在会话控制中处理强制结束游戏逻辑"""
         try:
-
             if self.game_state.end_game(group_id):
                 await event.send(event.plain_result("✅ 已强制结束当前海龟汤游戏"))
             else:
@@ -1943,12 +1965,10 @@ class SoupaiPlugin(Star):
             await event.send(event.plain_result(f"强制结束游戏时发生错误：{e}"))
 
     async def _handle_view_history_in_session(
-            self, event: AstrMessageEvent, group_id: str
+        self, event: AstrMessageEvent, group_id: str
     ):
         """在会话控制中处理查看历史记录逻辑"""
         try:
-
-
             game = self.game_state.get_game(group_id)
             if not game:
                 await event.send(event.plain_result("无法获取游戏状态"))
@@ -1972,8 +1992,8 @@ class SoupaiPlugin(Star):
             await event.send(event.plain_result(f"查看历史记录时发生错误：{e}"))
 
     async def _build_hint_result(
-            self, event: AstrMessageEvent, group_id: str
-    ) -> Optional[MessageEventResult]:
+        self, event: AstrMessageEvent, group_id: str
+    ) -> MessageEventResult | None:
         """生成提示结果，供指令或会话控制调用"""
         if not group_id:
             return event.plain_result("提示功能只能在群聊中使用")
@@ -2022,7 +2042,7 @@ class SoupaiPlugin(Star):
     }
 
     async def _handle_verification_in_session(
-            self, event: AstrMessageEvent, user_guess: str, answer: str
+        self, event: AstrMessageEvent, user_guess: str, answer: str
     ):
         """在会话控制中处理验证逻辑"""
         try:
@@ -2205,20 +2225,20 @@ class SoupaiPlugin(Star):
             user_input = event.message_str.strip()
             # 只拦截非本插件的指令，避免阻断自己的指令
             if (
-                    user_input.startswith("/")
-                    and not user_input.startswith("/备用结束")
-                    and not user_input.startswith("/汤")
-                    and not user_input.startswith("/揭晓")
-                    and not user_input.startswith("/验证")
-                    and not user_input.startswith("/汤状态")
-                    and not user_input.startswith("/强制结束")
-                    and not user_input.startswith("/备用开始")
-                    and not user_input.startswith("/备用状态")
-                    and not user_input.startswith("/汤配置")
-                    and not user_input.startswith("/重置题库")
-                    and not user_input.startswith("/题库详情")
-                    and not user_input.startswith("/查看")
-                    and not user_input.startswith("/提示")
+                user_input.startswith("/")
+                and not user_input.startswith("/备用结束")
+                and not user_input.startswith("/汤")
+                and not user_input.startswith("/揭晓")
+                and not user_input.startswith("/验证")
+                and not user_input.startswith("/汤状态")
+                and not user_input.startswith("/强制结束")
+                and not user_input.startswith("/备用开始")
+                and not user_input.startswith("/备用状态")
+                and not user_input.startswith("/汤配置")
+                and not user_input.startswith("/重置题库")
+                and not user_input.startswith("/题库详情")
+                and not user_input.startswith("/查看")
+                and not user_input.startswith("/提示")
             ):
                 yield event.plain_result(
                     "⚠️ 系统正在生成备用故事，请稍后再试或使用 /备用结束 停止生成"
@@ -2243,7 +2263,6 @@ class SoupaiPlugin(Star):
         storage_info = self.local_story_storage.get_storage_info()
         online_info = self.online_story_storage.get_storage_info()
         status = "🟢 运行中" if self.auto_generating else "🔴 已停止"
-
 
         # 检查存储库是否已满
         storage_full_warning = ""
@@ -2278,7 +2297,6 @@ class SoupaiPlugin(Star):
         self.local_story_storage.reset_usage()
         local_info = self.local_story_storage.get_storage_info()
 
-
         message = (
             f"✅ 题库使用记录已重置！\n"
             f"• 网络题库：{online_info['total']} 个谜题 (已重置)\n"
@@ -2303,7 +2321,6 @@ class SoupaiPlugin(Star):
         # 获取本地存储库详细信息
         local_info = self.local_story_storage.get_storage_info()
         local_usage = self.local_story_storage.get_usage_info()
-
 
         # 安全计算使用率，避免除零错误
         online_usage_rate = (
@@ -2403,26 +2420,28 @@ class SoupaiPlugin(Star):
     @filter.command("添加海龟汤")
     async def add_custom_soupai(self, event: AstrMessageEvent, content: str):
         """添加自定义海龟汤故事，格式: /添加海龟汤 <汤面>|<汤底>"""
-        
+
         # 确保自定义存储库已初始化
         self._ensure_story_storages()
-        
+
         # 解析内容格式: 汤面|汤底
         if "|" not in content:
-            yield event.plain_result("❌ 格式错误！请使用格式: /添加海龟汤 <汤面>|<汤底>")
+            yield event.plain_result(
+                "❌ 格式错误！请使用格式: /添加海龟汤 <汤面>|<汤底>"
+            )
             return
-        
+
         puzzle, answer = content.split("|", 1)
         puzzle = puzzle.strip()
         answer = answer.strip()
-        
+
         if not puzzle or not answer:
             yield event.plain_result("❌ 汤面和汤底都不能为空！")
             return
-        
+
         # 添加故事到自定义存储库
         success = self.custom_story_storage.add_story(puzzle, answer)
-        
+
         if success:
             # 获取添加后的故事索引
             story_index = len(self.custom_story_storage.stories) - 1
