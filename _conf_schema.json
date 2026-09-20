@@ -2,13 +2,15 @@
   "generate_llm_provider": {
     "description": "生成谜题的 LLM 服务商",
     "type": "string",
-    "hint": "留空则使用系统默认的 LLM 服务商。建议使用智力大于等于DeepSeek0-V2 R1的模型。",
+    "_special": "select_provider",
+    "hint": "下拉选择 AstrBot 里已配置的对话模型；留空则使用系统默认的 LLM 服务商。建议使用智力大于等于DeepSeek0-V2 R1的模型。",
     "default": ""
   },
   "judge_llm_provider": {
     "description": "判断问答和生成提示的 LLM 服务商",
     "type": "string",
-    "hint": "留空则使用系统默认的 LLM 服务商。不建议使用reasoning模型",
+    "_special": "select_provider",
+    "hint": "下拉选择 AstrBot 里已配置的对话模型；留空则使用系统默认的 LLM 服务商。不建议使用reasoning模型",
     "default": ""
   },
   "game_timeout": {
@@ -45,6 +47,12 @@
       "local_first",
       "custom_first",
       "random"
+    ],
+    "labels": [
+      "网络题库优先",
+      "本地存储库优先",
+      "自定义题库优先",
+      "随机选择"
     ]
   },
   "reply_mode": {
@@ -55,6 +63,10 @@
     "options": [
       "quote",
       "direct"
+    ],
+    "labels": [
+      "引用提问者的消息",
+      "直接回复"
     ]
   },
   "verification_limit": {
@@ -71,36 +83,56 @@
     "options": [
       "llm",
       "jev"
+    ],
+    "labels": [
+      "LLM（默认）",
+      "Jev（TypeSafe，快）"
     ]
   },
   "judge_fallback_to_llm": {
     "description": "Jev 判定不可用时改用 LLM",
     "type": "bool",
     "hint": "仅在判定引擎选 jev 时生效。开启后，遇到请求失败、超时、返回异常数据、或置信度低于下面的门槛，都改用 LLM 判定。建议保持开启——主要价值在于挡住服务抖动。关闭则一律采信 Jev，请求失败时只会提示稍后再试。",
-    "default": true
+    "default": true,
+    "condition": {
+      "judge_engine": "jev"
+    }
   },
   "jev_api_key": {
     "description": "Jev API Key",
     "type": "string",
+    "secret": true,
     "hint": "TypeSafe API Key。留空则即使开启上面的开关也不会启用。",
-    "default": ""
+    "default": "",
+    "condition": {
+      "judge_engine": "jev"
+    }
   },
   "jev_base_url": {
     "description": "Jev API 地址",
     "type": "string",
     "hint": "官方为 https://api.typesafe.ai ，使用中转站则填中转地址（需支持原生 /v1/systemone 端点）。",
-    "default": "https://api.typesafe.ai"
+    "default": "https://api.typesafe.ai",
+    "condition": {
+      "judge_engine": "jev"
+    }
   },
   "jev_model": {
     "description": "Jev 模型名",
     "type": "string",
     "hint": "默认 jev-latest。可填 jev-preview 或锁定具体版本如 jev-1.13.0。",
-    "default": "jev-latest"
+    "default": "jev-latest",
+    "condition": {
+      "judge_engine": "jev"
+    }
   },
   "jev_judge_min_confidence": {
     "description": "Jev 判定的最低置信度",
     "type": "float",
     "hint": "低于此值就改用 LLM 判定，需上面的兜底开关为开才生效。不建议调高：在本插件题库上实测 44 条，低置信区间的判定反而全部正确，置信度并不能预示判错，调高只会让请求白白流向 LLM（门槛 0.9 时约四分之一的判定会走 LLM，却拦不下任何错误）。填 0 表示只在请求失败时才回落。",
-    "default": 0.5
+    "default": 0.5,
+    "condition": {
+      "judge_engine": "jev"
+    }
   }
 }

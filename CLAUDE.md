@@ -51,6 +51,15 @@ This is an AstrBot plugin, so development involves:
   in the LLM prompt: both paths must classify the same way, or flipping the
   setting changes how the game feels.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
+- **Config schema**: `_conf_schema.json` is rendered by the dashboard's
+  `ConfigItemRenderer`. Two provider fields carry `"_special":
+  "select_provider"`, which swaps the text box for the same provider dropdown
+  the core settings use — it emits the provider `id`, which is exactly the key
+  `get_provider_by_id` expects. Enum fields pair `options` with a same-length
+  `labels` array so the panel shows Chinese instead of the raw value.
+  Jev-only fields carry `"condition": {"judge_engine": "jev"}` and are hidden
+  until that engine is chosen; the keys still exist in the saved config, so
+  nothing in `main.py` needs to care whether they were visible.
 
 ## Important Patterns
 
