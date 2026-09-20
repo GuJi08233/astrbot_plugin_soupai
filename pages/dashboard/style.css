@@ -50,7 +50,7 @@ body {
 
 /* ── 顶栏 ── */
 .topbar {
-  display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap;
 }
 .tabs { display: flex; gap: 4px; }
 .tab {
@@ -59,7 +59,9 @@ body {
 }
 .tab:hover { background: var(--surface); color: var(--text); }
 .tab.is-active { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-.topbar #refresh { margin-left: auto; }
+.refresh-controls { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.refresh-status { margin: 0 0 14px; min-height: 21px; font-size: 12px; }
+.refresh-status.is-error { color: var(--danger); }
 
 /* ── 统计 ── */
 .stat-row {
@@ -145,6 +147,16 @@ body {
 .qa .tag { margin-left: 8px; vertical-align: 1px; }
 .tag-jev { background: var(--ok); color: var(--surface); border-color: transparent; }
 .tag-fallback { background: var(--used-bg); color: var(--used); border-color: transparent; }
+.judge-details { margin: 8px 0 14px; padding: 8px 12px; border-radius: 8px; background: var(--bg); }
+.judge-details > summary { color: var(--text); }
+.judge-info { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 8px; }
+.judge-info p { margin: 0; font-size: 12px; }
+.judge-note { margin: 8px 0; font-size: 12px; }
+.judge-probabilities { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 8px 0; }
+.judge-probability { padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.judge-probability.is-choice { border-color: var(--accent); }
+.judge-probability dt { color: var(--muted); font-size: 12px; }
+.judge-probability dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
 
 /* ── 分页 ── */
 .pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 16px; }

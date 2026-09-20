@@ -89,6 +89,7 @@
   // ─────────────────────────────────────────── 状态
 
   const state = {
+    tab: 'stories',
     source: 'network',
     page: 1,
     pageSize: 20,
@@ -173,9 +174,13 @@
     const data = await api.get('overview', state.session ? { session: state.session } : {});
     state.sources = data.sources || [];
     state.sessions = data.sessions || [];
-    renderStats(data);
-    renderSourceSeg();
-    renderSessionFilter();
+    const snapshot = JSON.stringify(data);
+    if ($('#statRow').dataset.snapshot !== snapshot) {
+      renderStats(data);
+      renderSourceSeg();
+      renderSessionFilter();
+      $('#statRow').dataset.snapshot = snapshot;
+    }
     return data;
   }
 
@@ -208,7 +213,7 @@
         state.source = s.source;
         state.page = 1;
         renderSourceSeg();
-        loadStories();
+        refreshCurrentTab();
       };
       seg.appendChild(btn);
     });
@@ -230,6 +235,7 @@
   }
 
   async function loadStories() {
+    const selection = JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session]);
     const params = {
       source: state.source,
       page: state.page,
@@ -239,18 +245,15 @@
     if (state.searchAnswer) params.search_answer = '1';
     if (state.session) params.session = state.session;
 
-    showLoading('#list', 4);
-    let data;
-    try {
-      data = await api.get('stories', params);
-    } catch (err) {
-      $('#list').innerHTML = '';
-      $('#list').appendChild(el('div', 'empty', `加载失败：${err.message}`));
-      toast(err.message, 'error');
-      return;
-    }
+    if (!$('#list').children.length) showLoading('#list', 4);
+    const data = await api.get('stories', params);
+    if (selection !== JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session])) return;
+    const snapshot = JSON.stringify([selection, data]);
+    if ($('#list').dataset.snapshot === snapshot) return;
     state.total = data.total;
     renderList(data);
+    $('#list').dataset.snapshot = snapshot;
+    $('#list').dataset.selection = selection;
   }
 
   function renderList(data) {
@@ -318,8 +321,7 @@
         const ok = await confirmDialog('删除这道题？', item.puzzle, { okText: '删除' });
         if (!ok) return;
         await guard(api.post('story/delete', { source: state.source, id: item.id }), '已删除');
-        await loadOverview();
-        await loadStories();
+        await refreshCurrentTab();
       };
       actions.appendChild(del);
     }
@@ -331,8 +333,7 @@
         api.post('story/hide', { source: state.source, id: item.id, hidden: !item.hidden }),
         item.hidden ? '已取消屏蔽' : '已屏蔽',
       );
-      await loadOverview();
-      await loadStories();
+      await refreshCurrentTab();
     };
     actions.appendChild(hideBtn);
 
@@ -345,8 +346,7 @@
           }),
           '已更新',
         );
-        await loadOverview();
-        await loadStories();
+        await refreshCurrentTab();
       };
       actions.appendChild(mark);
     }
@@ -358,18 +358,13 @@
   // ─────────────────────────────────────────── 会话
 
   async function loadSessions() {
-    showLoading('#sessionList', 2);
-    let data;
-    try {
-      data = await api.get('overview', {});
-    } catch (err) {
-      $('#sessionList').innerHTML = '';
-      $('#sessionList').appendChild(el('div', 'empty', `加载失败：${err.message}`));
-      toast(err.message, 'error');
-      return;
-    }
+    if (!$('#sessionList').children.length) showLoading('#sessionList', 2);
+    const data = await api.get('overview', {});
     state.sessions = data.sessions || [];
     const list = $('#sessionList');
+    const snapshot = JSON.stringify(state.sessions);
+    if (list.dataset.snapshot === snapshot) return;
+    list.dataset.snapshot = snapshot;
     list.innerHTML = '';
     if (!state.sessions.length) {
       list.appendChild(el('div', 'empty', '还没有任何会话出过题'));
@@ -391,7 +386,6 @@
         state.page = 1;
         switchTab('stories');
         renderSessionFilter();
-        loadOverview().then(loadStories);
       };
       actions.appendChild(view);
 
@@ -404,7 +398,7 @@
         );
         if (!ok) return;
         await guard(api.post('usage/reset', { session: s.session }), '已重置');
-        loadSessions();
+        refreshCurrentTab();
       };
       actions.appendChild(reset);
       card.appendChild(actions);
@@ -430,6 +424,11 @@
     return el('span', 'tag tag-muted', '判定失败');
   }
 
+  function formatPercent(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+      ? `${(value * 100).toFixed(1)}%` : '未提供';
+  }
+
   function judgeSummary(history) {
     const n = { jev: 0, fallback: 0, llm: 0, bad: 0 };
     history.forEach((qa) => {
@@ -448,21 +447,19 @@
   }
 
   async function loadGames() {
-    showLoading('#gameList', 2);
-    let data;
-    try {
-      data = await api.get('games', {});
-    } catch (err) {
-      $('#gameList').innerHTML = '';
-      $('#gameList').appendChild(el('div', 'empty', `加载失败：${err.message}`));
-      toast(err.message, 'error');
-      return;
-    }
-    const list = $('#gameList');
-    list.innerHTML = '';
+    const currentList = $('#gameList');
+    if (!currentList.children.length) showLoading('#gameList', 2);
+    const data = await api.get('games', {});
+    const snapshot = JSON.stringify(data);
+    if (currentList.dataset.snapshot === snapshot) return;
+    // Rebuild offscreen, keeping disclosure state and the user's current scroll.
+    const scrollPosition = [window.scrollX, window.scrollY];
+    const expanded = new Set([...currentList.querySelectorAll('details[open]')]
+      .map((details) => details.dataset.detailKey));
+    const focusedDetail = document.activeElement?.closest('details')?.dataset.detailKey;
+    const list = document.createDocumentFragment();
     if (!data.games.length) {
       list.appendChild(el('div', 'empty', '当前没有进行中的对局'));
-      return;
     }
     data.games.forEach((g) => {
       const card = el('div', 'card');
@@ -482,14 +479,56 @@
 
       if (g.qa_history && g.qa_history.length) {
         const details = el('details', 'qa');
+        details.dataset.detailKey = `${g.key}:${g.started_at || ''}:history`;
+        details.open = expanded.has(details.dataset.detailKey);
         details.appendChild(el('summary', null, `问答记录（${g.qa_history.length}）`));
         const ol = el('ol');
-        g.qa_history.forEach((qa) => {
+        g.qa_history.forEach((qa, index) => {
           const li = el('li');
           li.appendChild(el('span', 'qa-q', qa.question));
           li.appendChild(el('span', 'qa-a', qa.answer));
           const by = judgedByTag(qa.judged_by);
           if (by) li.appendChild(by);
+          const judgement = qa.judged_by || {};
+          const jev = judgement.jev;
+          if (jev || judgement.engine === 'jev' || judgement.fallback) {
+            const metrics = el('details', 'judge-details');
+            metrics.dataset.detailKey = `${g.key}:${g.started_at || ''}:judge:${index}`;
+            metrics.open = expanded.has(metrics.dataset.detailKey);
+            metrics.appendChild(el('summary', null, 'Jev 判定详情'));
+            const info = el('div', 'judge-info');
+            info.appendChild(el('p', null, `Jev 原选项：${jev?.choice || '未提供'}`));
+            const confidence = jev ? jev.confidence : judgement.confidence;
+            info.appendChild(el('p', null,
+              `整体置信度：${formatPercent(confidence)}${!jev && confidence != null ? '（旧记录）' : ''}`));
+            info.appendChild(el('p', null, `采用门槛：${formatPercent(jev?.threshold)}`));
+            const reasons = {
+              low_confidence: '整体置信度低于采用门槛',
+              request_failed: 'Jev 请求失败',
+              invalid_response: 'Jev 响应格式无效',
+              unknown_choice: 'Jev 返回了候选之外的选项',
+            };
+            const reason = jev?.reason === null && judgement.engine === 'jev'
+              ? '无（已采用 Jev 判定）' : reasons[jev?.reason] || '未提供';
+            info.appendChild(el('p', null, `回退原因：${reason}`));
+            metrics.appendChild(info);
+            metrics.appendChild(el('p', 'judge-note muted',
+              '以下为 Jev 返回的选项概率；整体置信度是独立指标，不等于最高选项概率。'));
+            const probabilities = el('dl', 'judge-probabilities');
+            ['是', '否', '不重要', '是也不是'].forEach((choice) => {
+              const row = el('div', 'judge-probability');
+              if (choice === jev?.choice) row.classList.add('is-choice');
+              row.appendChild(el('dt', null, choice));
+              row.appendChild(el('dd', null, formatPercent(jev?.probabilities?.[choice])));
+              probabilities.appendChild(row);
+            });
+            metrics.appendChild(probabilities);
+            if (!jev) {
+              metrics.appendChild(el('p', 'judge-note muted',
+                '旧记录未保存 Jev 原选项、四选项概率、采用门槛和回退原因。'));
+            }
+            li.appendChild(metrics);
+          }
           ol.appendChild(li);
         });
         details.appendChild(ol);
@@ -506,12 +545,20 @@
         );
         if (!ok) return;
         await guard(api.post('games/end', { key: g.key }), '已结束');
-        loadGames();
+        refreshCurrentTab();
       };
       actions.appendChild(end);
       card.appendChild(actions);
       list.appendChild(card);
     });
+    currentList.replaceChildren(list);
+    currentList.dataset.snapshot = snapshot;
+    if (focusedDetail) {
+      [...currentList.querySelectorAll('details')]
+        .find((details) => details.dataset.detailKey === focusedDetail)
+        ?.querySelector('summary')?.focus({ preventScroll: true });
+    }
+    window.scrollTo(...scrollPosition);
   }
 
   // ─────────────────────────────────────────── 弹窗
@@ -559,8 +606,7 @@
       }
     }
     $('#editor').hidden = true;
-    await loadOverview();
-    await loadStories();
+    await refreshCurrentTab();
   }
 
   async function runGenerate() {
@@ -591,8 +637,7 @@
       toast(`生成完成：成功 ${(data.created || []).length} 道`, 'ok');
       state.source = 'local';
       renderSourceSeg();
-      await loadOverview();
-      await loadStories();
+      await refreshCurrentTab();
     } catch (err) {
       box.innerHTML = '';
       box.appendChild(el('p', 'error-text', err.message));
@@ -611,6 +656,7 @@
     providers: [],
     hasKey: false,
     dirty: false,
+    revision: 0,
   };
 
   // provider 下拉显示「id（model）」
@@ -619,7 +665,9 @@
   }
 
   async function loadConfig() {
-    const data = await guard(api.get('config', {}));
+    const revision = cfg.revision;
+    const data = await api.get('config', {});
+    if (revision !== cfg.revision) return false;
     cfg.schema = data.schema || {};
     cfg.providers = data.providers || [];
     cfg.hasKey = !!data.has_jev_api_key;
@@ -640,6 +688,7 @@
     if (cfg.values[key] === value) return;
     cfg.values[key] = value;
     cfg.dirty = true;
+    cfg.revision++;
     // judge_engine 的开关会增删 Jev 区块，必须整表重绘；普通输入不要
     // 重绘，否则打字打到一半会丢焦点
     if (rerender) renderConfigForm();
@@ -662,7 +711,7 @@
     const isNumeric = meta.type === 'int' || meta.type === 'float';
     if (meta._special === 'select_provider') {
       input = el('select', 'input');
-      input.appendChild(new Option('（使用系统默认）', ''));
+      input.appendChild(new Option(key === 'hint_llm_provider' ? '（跟随判断问答 LLM）' : '（使用系统默认）', ''));
       cfg.providers.forEach((p) => input.appendChild(new Option(providerLabel(p), p.id)));
       input.value = cfg.values[key] || '';
       input.onchange = (e) => setValue(key, e.target.value);
@@ -727,21 +776,92 @@
   function resetConfig() {
     cfg.values = { ...cfg.saved };
     cfg.dirty = false;
+    cfg.revision++;
     renderConfigForm();
   }
 
   // ─────────────────────────────────────────── 交互绑定
 
+  let refreshing = false;
+  let refreshQueued = false;
+
+  async function refreshCurrentTab({ manual = false, automatic = false } = {}) {
+    if (automatic && (!$('#autoRefresh').checked || document.hidden || state.tab === 'settings'
+      || pending.size || document.querySelector('.modal:not([hidden])'))) return;
+    if (refreshing) {
+      if (!automatic) refreshQueued = true;
+      return;
+    }
+    if (state.tab === 'settings' && cfg.dirty && !manual) {
+      $('#refreshStatus').textContent = '设置有未保存修改，已保留当前表单；设置页暂停自动刷新。';
+      return;
+    }
+
+    refreshing = true;
+    const tab = state.tab;
+    const button = $('#refresh');
+    const status = $('#refreshStatus');
+    button.disabled = true;
+    button.textContent = '刷新中…';
+    status.classList.remove('is-error');
+    try {
+      if (tab === 'settings' && cfg.dirty) {
+        const confirmed = await confirmDialog('重新加载设置？', '尚未保存的修改会丢失。', { okText: '重新加载' });
+        if (!confirmed) {
+          status.textContent = '已保留未保存的设置修改；设置页暂停自动刷新。';
+          return;
+        }
+      }
+      if (!automatic) status.textContent = '正在刷新当前标签…';
+      let preservedConfig = false;
+      if (tab === 'stories') {
+        const selection = JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session]);
+        if ($('#list').dataset.selection !== selection) {
+          showLoading('#list', 4);
+          delete $('#list').dataset.snapshot;
+        }
+        await loadOverview();
+        if (state.tab === tab) await loadStories();
+      } else if (tab === 'sessions') await loadSessions();
+      else if (tab === 'games') await loadGames();
+      else if (tab === 'settings') preservedConfig = await loadConfig() === false;
+
+      if (state.tab === tab) {
+        const note = tab === 'settings' ? ' · 设置页暂停自动刷新'
+          : $('#autoRefresh').checked ? ' · 每 5 秒自动刷新' : ' · 自动刷新已关闭';
+        status.textContent = preservedConfig
+          ? '已保留刷新期间的设置修改；设置页暂停自动刷新。'
+          : `上次刷新 ${new Date().toLocaleTimeString()}${note}`;
+        if (manual) toast(preservedConfig ? '已保留当前设置修改' : '当前标签已刷新', preservedConfig ? 'info' : 'ok');
+      }
+    } catch (err) {
+      if (state.tab === tab) {
+        status.textContent = `刷新失败：${err.message || String(err)}。已保留上次显示的数据。`;
+        status.classList.add('is-error');
+        const panel = document.querySelector(`.panel[data-panel="${tab}"]`);
+        panel.querySelectorAll('.skeleton').forEach((node) => node.remove());
+      }
+      if (!automatic) toast(err.message || String(err), 'error');
+    } finally {
+      refreshing = false;
+      button.disabled = false;
+      button.textContent = '刷新';
+      if (refreshQueued) {
+        refreshQueued = false;
+        void refreshCurrentTab();
+      }
+    }
+  }
+
   function switchTab(name) {
+    state.tab = name;
     document.querySelectorAll('.tab').forEach((t) => {
       t.classList.toggle('is-active', t.dataset.tab === name);
     });
     document.querySelectorAll('.panel').forEach((p) => {
       p.hidden = p.dataset.panel !== name;
     });
-    if (name === 'sessions') loadSessions();
-    if (name === 'games') loadGames();
-    if (name === 'settings') loadConfig();
+    refreshCurrentTab();
   }
 
   document.querySelectorAll('.tab').forEach((tab) => {
@@ -754,21 +874,27 @@
     searchTimer = setTimeout(() => {
       state.keyword = e.target.value.trim();
       state.page = 1;
-      loadStories();
+      refreshCurrentTab();
     }, 260);
   };
   $('#searchAnswer').onchange = (e) => {
     state.searchAnswer = e.target.checked;
-    if (state.keyword) loadStories();
+    if (state.keyword) refreshCurrentTab();
   };
   $('#sessionFilter').onchange = (e) => {
     state.session = e.target.value;
     state.page = 1;
-    loadOverview().then(loadStories);
+    refreshCurrentTab();
   };
-  $('#prev').onclick = () => { if (state.page > 1) { state.page--; loadStories(); } };
-  $('#next').onclick = () => { state.page++; loadStories(); };
-  $('#refresh').onclick = () => { loadOverview().then(loadStories); };
+  $('#prev').onclick = () => { if (state.page > 1) { state.page--; refreshCurrentTab(); } };
+  $('#next').onclick = () => { state.page++; refreshCurrentTab(); };
+  $('#refresh').onclick = () => refreshCurrentTab({ manual: true });
+  $('#autoRefresh').onchange = () => {
+    $('#refreshStatus').textContent = $('#autoRefresh').checked
+      ? '自动刷新已开启（每 5 秒）；后台、弹窗和设置编辑期间暂停。'
+      : '自动刷新已关闭，可手动刷新当前标签。';
+    if ($('#autoRefresh').checked) refreshCurrentTab({ automatic: true });
+  };
   $('#btnCreate').onclick = () => openEditor(null);
   $('#editSave').onclick = saveEditor;
   $('#btnGenerate').onclick = () => { $('#genResult').hidden = true; $('#genModal').hidden = false; };
@@ -783,7 +909,7 @@
     );
     if (!ok) return;
     await guard(api.post('usage/reset', {}), '已全部重置');
-    loadSessions();
+    refreshCurrentTab();
   };
   $('#confirmOk').onclick = () => closeConfirm(true);
   $('#confirmCancel').onclick = () => closeConfirm(false);
@@ -816,9 +942,10 @@
 
   // 启动
   initTheme();
-  showLoading('#list', 4);
-  loadOverview().then(loadStories).catch((err) => {
-    $('#list').innerHTML = '';
-    $('#list').appendChild(el('div', 'empty', `加载失败：${err.message}`));
+  refreshCurrentTab();
+  const refreshTimer = setInterval(() => refreshCurrentTab({ automatic: true }), 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshCurrentTab({ automatic: true });
   });
+  window.addEventListener('pagehide', () => clearInterval(refreshTimer));
 })();

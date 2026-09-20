@@ -25,7 +25,9 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 ## Development Commands
 
 This is an AstrBot plugin, so development involves:
-1. **Testing**: No formal test framework found - manual testing required
+1. **Testing**: Run `python -m unittest discover -s tests -p test_judging.py`
+   from this plugin directory using AstrBot's Python environment. These tests
+   mock model requests and framework imports; no live game or API key is needed.
 2. **Linting**: No specific linting configuration found
 3. **Building**: No build process - it's a Python plugin file
 4. **Installation**: Copy to `AstrBot/data/plugins/` directory
@@ -47,20 +49,27 @@ This is an AstrBot plugin, so development involves:
 - **LLM integration**: Go through `self._resolve_provider(provider_id, umo)`
   rather than calling `get_using_provider` / `get_provider_by_id` directly —
   it centralises the fallback and passes `umo` so per-session provider
-  isolation keeps working.
+  isolation keeps working. `generate_llm_provider` selects the puzzle model;
+  `judge_llm_provider` handles question verdicts and answer verification;
+  `hint_llm_provider` selects the hint model and follows `judge_llm_provider`
+  when empty.
 - **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
   config) or `self._safe_send()` (swallows send failures). Do not call
   `event.send(event.plain_result(...))` directly on paths that end a game.
 - **Jev (optional, question verdicts only)**: when `judge_engine` is `jev`,
   `judge_question` tries `self._jev_choice()` first — a TypeSafe System One
-  Choice call that can only return one of the keys you pass in. It returns
-  `None` on low confidence, an unknown option, or any transport error, and the
-  caller falls back to the LLM. Keep `_JUDGE_CRITERIA` in step with the wording
-  in the LLM prompt: both paths must classify the same way, or flipping the
-  setting changes how the game feels.
+  Choice call that can only return one of the keys you pass in. It returns a
+  detail dict for each Jev attempt, including failures; a nonempty `reason`
+  triggers fallback when enabled. Only LLM mode returns `None`. Keep the
+  original Jev detail even when the final verdict comes from the LLM.
+  `probabilities` contains candidate probabilities, while `confidence` is a
+  separate overall confidence value: never derive one from the other or
+  invent values absent from the response or older question records. Keep
+  `_JUDGE_CRITERIA` in step with the wording in the LLM prompt: both paths must
+  classify the same way, or flipping the setting changes how the game feels.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 - **Config schema**: `_conf_schema.json` is rendered by the dashboard's
-  `ConfigItemRenderer`. Two provider fields carry `"_special":
+  `ConfigItemRenderer`. Three provider fields carry `"_special":
   "select_provider"`, which swaps the text box for the same provider dropdown
   the core settings use — it emits the provider `id`, which is exactly the key
   `get_provider_by_id` expects. Enum fields pair `options` with a same-length
@@ -135,6 +144,16 @@ reloads, this one doesn't), which is exactly why `_load_config` exists. The
 `jev_api_key` field is write-only from the web: GET masks it to `""`, an
 empty POST value means "unchanged" and is skipped, and clearing it requires
 the explicit `clear_jev_api_key` flag.
+
+The top refresh button reloads the active tab. Automatic refresh is enabled
+by default every five seconds; its toggle lasts for the current page only.
+Pause it while the page is hidden, a dialog is open, a request is in progress,
+or the settings tab is active. Do not overlap refresh requests. Preserve
+expanded game histories, Jev details and scroll position across refreshes.
+Keep unsaved settings when switching tabs, confirm before manually discarding
+them, and do not overwrite edits made while a settings request is in flight.
+Jev details belong to each question record and remain inspectable after an
+LLM fallback; display missing data explicitly instead of reconstructing it.
 
 ## Invariants Worth Keeping
 

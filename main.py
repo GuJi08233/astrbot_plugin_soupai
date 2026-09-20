@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import random
 import threading
@@ -627,6 +628,9 @@ class SoupaiPlugin(Star):
         """
         self.generate_llm_provider_id = self.config.get("generate_llm_provider", "")
         self.judge_llm_provider_id = self.config.get("judge_llm_provider", "")
+        self.hint_llm_provider_id = str(
+            self.config.get("hint_llm_provider") or ""
+        ).strip()
         self.game_timeout = self.config.get("game_timeout", 300)
         self.storage_max_size = self.config.get("storage_max_size", 50)
         self.auto_generate_start = self.config.get("auto_generate_start", 3)
@@ -817,14 +821,17 @@ class SoupaiPlugin(Star):
         state: dict,
         instructions: str,
         criteria: dict[str, str],
-    ) -> tuple[str, float] | None:
-        """用 Jev 做一次单选判定。
+    ) -> dict | None:
+        """Request a choice while retaining Jev diagnostics for the dashboard.
 
-        返回 (选中的选项, 置信度)；未启用 Jev、置信度不足或请求失败时返回
-        None，调用方据此改用 LLM。Jev 只会返回 criteria 里的键，不会跑题。
+        Args:
+            state: Puzzle facts and the player's question.
+            instructions: Instructions for selecting a verdict.
+            criteria: Allowed verdicts and their definitions.
 
-        关闭兜底时置信度门槛不生效（始终采信 Jev），但请求真的失败时
-        仍然返回 None —— 否则玩家等不到任何回复。
+        Returns:
+            Choice, confidence, option probabilities, threshold, and a failure
+            reason. A nonempty reason requests fallback; None means Jev is off.
         """
         if self.judge_engine != "jev":
             return None
@@ -832,13 +839,13 @@ class SoupaiPlugin(Star):
         min_confidence = (
             self.jev_judge_min_confidence if self.judge_fallback_to_llm else 0.0
         )
-
-        if self._jev_client is None:
-            self._jev_client = httpx.AsyncClient(
-                base_url=self.jev_base_url,
-                headers={"Authorization": f"Bearer {self.jev_api_key}"},
-                timeout=httpx.Timeout(15.0),
-            )
+        result = {
+            "choice": None,
+            "confidence": None,
+            "probabilities": {},
+            "threshold": min_confidence,
+            "reason": None,
+        }
 
         payload = {
             "model": self.jev_model,
@@ -852,26 +859,62 @@ class SoupaiPlugin(Star):
             },
         }
         try:
+            if self._jev_client is None:
+                self._jev_client = httpx.AsyncClient(
+                    base_url=self.jev_base_url,
+                    headers={"Authorization": f"Bearer {self.jev_api_key}"},
+                    timeout=httpx.Timeout(15.0),
+                )
             resp = await self._jev_client.post("/v1/systemone", json=payload)
             resp.raise_for_status()
-            answer = resp.json()["answers"]["verdict"]
-            choice = answer["choice"]
-            confidence = answer.get("confidence", 0.0)
         except Exception as e:
-            logger.warning(f"Jev 判定失败，改用 LLM: {e}")
-            return None
+            logger.warning(f"Jev request failed: {e}")
+            result["reason"] = "request_failed"
+            return result
 
-        if choice not in criteria:
-            logger.warning(f"Jev 返回了未知选项 {choice!r}，改用 LLM")
-            return None
+        try:
+            answer = resp.json()["answers"]["verdict"]
+            choice = answer.get("choice")
+            confidence = answer.get("confidence")
+            probabilities = answer.get("probabilities", {})
+            # Preserve the API's distribution; confidence is a separate metric.
+            if isinstance(probabilities, dict):
+                for option in criteria:
+                    probability = probabilities.get(option)
+                    if (
+                        isinstance(probability, (int, float))
+                        and not isinstance(probability, bool)
+                        and 0 <= probability <= 1
+                        and math.isfinite(probability)
+                    ):
+                        result["probabilities"][option] = float(probability)
+            if isinstance(choice, str):
+                result["choice"] = choice
+            if (
+                isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                and 0 <= confidence <= 1
+                and math.isfinite(confidence)
+            ):
+                result["confidence"] = float(confidence)
+            else:
+                raise ValueError("Missing or invalid Jev confidence")
+        except Exception as e:
+            logger.warning(f"Invalid Jev response: {e}")
+            result["reason"] = "invalid_response"
+            return result
+
+        if not isinstance(choice, str) or choice not in criteria:
+            logger.warning(f"Jev returned an unknown choice: {choice!r}")
+            result["reason"] = "unknown_choice"
+            return result
         if confidence < min_confidence:
-            logger.info(
-                f"Jev 判定 {choice!r} 置信度 {confidence:.2f} 低于 {min_confidence}，改用 LLM"
-            )
-            return None
+            logger.info(f"Jev confidence {confidence:.2f} is below {min_confidence}")
+            result["reason"] = "low_confidence"
+            return result
 
-        logger.info(f"Jev 判定: {choice}（置信度 {confidence:.2f}）")
-        return choice, confidence
+        logger.info(f"Jev verdict: {choice}, confidence: {confidence:.2f}")
+        return result
 
     def _resolve_provider(self, provider_id: str, umo: str | None = None):
         """解析要使用的 LLM 提供商，未找到时返回 None 并记录日志。
@@ -1237,12 +1280,17 @@ class SoupaiPlugin(Star):
         umo: str | None = None,
         puzzle: str = "",
     ) -> tuple[str, dict]:
-        """判断用户提问的回答方式，优先走 Jev，失败则用 LLM。
+        """Judge a question and retain diagnostics even when falling back.
 
-        返回 (判定文本, 判定来源)。来源形如 ``{"engine": "jev",
-        "confidence": 0.99}`` 或 ``{"engine": "llm", "fallback": True}``，
-        网页端的对局页靠它标出每一问到底是谁判的；判不出来时是
-        ``{"engine": "unavailable"}``，那条回复不是真正的判定结果。
+        Args:
+            question: The player's question or statement.
+            true_answer: The complete story used to judge the question.
+            umo: Session origin used to resolve the LLM provider.
+            puzzle: The public puzzle text supplied to Jev.
+
+        Returns:
+            Verdict text and source metadata, including the original Jev
+            probabilities and fallback reason when Jev was attempted.
         """
 
         jev_choice = await self._jev_choice(
@@ -1250,19 +1298,27 @@ class SoupaiPlugin(Star):
             instructions="海龟汤推理游戏。请判断`玩家提问`的说法，相对于`真相`应当如何回答。",
             criteria=self._JUDGE_CRITERIA,
         )
-        if jev_choice:
-            choice, confidence = jev_choice
-            return choice, {"engine": "jev", "confidence": round(confidence, 2)}
+        source = {"jev": jev_choice} if jev_choice is not None else {}
+        if jev_choice is not None and jev_choice["reason"] is None:
+            return jev_choice["choice"], {
+                "engine": "jev",
+                "confidence": jev_choice["confidence"],
+                **source,
+            }
+        unavailable = {"engine": "unavailable", **source}
         if self.judge_engine == "jev" and not self.judge_fallback_to_llm:
             # 选了 Jev 又关了兜底，走到这里说明请求真的失败了
-            return "判定服务暂时不可用，请稍后再问一次", {"engine": "unavailable"}
+            return "判定服务暂时不可用，请稍后再问一次", unavailable
 
         # 配置的是 Jev 却走到这里，说明上面那次判定没成，这一问是回退来的
-        llm_source = {"engine": "llm", "fallback": self.judge_engine == "jev"}
+        llm_source = {
+            "engine": "llm",
+            "fallback": self.judge_engine == "jev",
+            **source,
+        }
 
         provider = self._resolve_provider(self.judge_llm_provider_id, umo)
         if provider is None:
-            unavailable = {"engine": "unavailable"}
             if self.judge_llm_provider_id:
                 return "（未配置判断 LLM，无法判断）", unavailable
             return "（未配置 LLM，无法判断）", unavailable
@@ -1308,12 +1364,12 @@ class SoupaiPlugin(Star):
                 return reply, llm_source
             return (
                 "你给ai干宕机了或者有什么其他原因，反正他没好好回复，我也不知道为什么（我努力修过代码了）",
-                {"engine": "unavailable"},
+                unavailable,
             )
 
         except Exception as e:
             logger.error(f"判断问题失败: {e}")
-            return "（判断失败，请重试）", {"engine": "unavailable"}
+            return "（判断失败，请重试）", unavailable
 
     # ✅ 生成方向性提示
     def build_allow_list(self, puzzle: str, qa_history: list[dict]) -> list[str]:
@@ -1351,10 +1407,11 @@ class SoupaiPlugin(Star):
         umo: str | None = None,
     ) -> str:
         """根据本局已记录的问答与提示生成新的方向性提示"""
-        provider = self._resolve_provider(self.judge_llm_provider_id, umo)
+        provider_id = self.hint_llm_provider_id or self.judge_llm_provider_id
+        provider = self._resolve_provider(provider_id, umo)
         if provider is None:
-            if self.judge_llm_provider_id:
-                return "（未配置判断 LLM，无法提供提示）"
+            if provider_id:
+                return "（未配置提示 LLM，无法提供提示）"
             return "（未配置 LLM，无法提供提示）"
 
         history_text = "\n".join(
@@ -2481,6 +2538,7 @@ class SoupaiPlugin(Star):
             f"⚙️ 海龟汤插件配置：\n"
             f"• 生成谜题 LLM：{self.generate_llm_provider_id or '默认'}\n"
             f"• 判断问答 LLM：{self.judge_llm_provider_id or '默认'}\n"
+            f"• 生成提示 LLM：{self.hint_llm_provider_id or '跟随判断问答 LLM'}\n"
             f"• 游戏超时：{self.game_timeout} 秒\n"
             f"• 网络题库：{online_info['total']} 个谜题 (已用: {online_info['used']}, 剩余: {online_info['available']})\n"
             f"• 本地存储库：{local_info['total']}/{local_info['max_size']} (已用: {local_info['used']}, 剩余: {local_info['remaining']})\n"

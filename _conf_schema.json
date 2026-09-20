@@ -7,10 +7,17 @@
     "default": ""
   },
   "judge_llm_provider": {
-    "description": "判断问答和生成提示的 LLM 服务商",
+    "description": "判断问答和验证答案的 LLM 服务商",
     "type": "string",
     "_special": "select_provider",
-    "hint": "下拉选择 AstrBot 里已配置的对话模型；留空则使用系统默认的 LLM 服务商。不建议使用reasoning模型",
+    "hint": "用于问答判定（含 Jev 回退）和 /验证；留空使用当前会话的默认 LLM 服务商。",
+    "default": ""
+  },
+  "hint_llm_provider": {
+    "description": "生成提示的 LLM 服务商",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "独立选择 /提示 使用的模型；留空跟随判断问答的 LLM 服务商。",
     "default": ""
   },
   "game_timeout": {
