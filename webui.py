@@ -32,11 +32,6 @@ def _ok(data: Any = None):
     return json_response({"status": "ok", "data": data})
 
 
-def _preview(text: str, limit: int = 80) -> str:
-    text = (text or "").strip().replace("\n", " ")
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 class SoupaiWebApi:
     """把题库管理能力暴露给 AstrBot 面板。"""
 

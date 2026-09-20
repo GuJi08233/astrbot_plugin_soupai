@@ -873,7 +873,7 @@ class SoupaiPlugin(Star):
             # 格式4: 尝试从文本中提取题面和答案
             else:
                 lines = text.split("\n")
-                for i, line in enumerate(lines):
+                for line in lines:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
@@ -1510,7 +1510,7 @@ class SoupaiPlugin(Star):
                 )
 
                 # 启动会话控制
-                await self._start_game_session(event, group_id, answer)
+                await self._start_game_session(event, group_id)
             else:
                 yield event.plain_result("游戏启动失败，请重试")
 
@@ -1560,10 +1560,8 @@ class SoupaiPlugin(Star):
         logger.info(f"游戏已结束，群ID: {group_id}")
 
     # 🎯 游戏会话控制
-    async def _start_game_session(
-        self, event: AstrMessageEvent, group_id: str, answer: str
-    ):
-        """启动游戏会话控制"""
+    async def _start_game_session(self, event: AstrMessageEvent, group_id: str):
+        """启动游戏会话控制。答案每次从 game_state 现取，不在这里缓存"""
         try:
 
             @session_waiter(timeout=self.game_timeout, record_history_chains=False)
