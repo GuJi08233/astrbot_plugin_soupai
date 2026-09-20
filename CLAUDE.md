@@ -35,6 +35,13 @@ This is an AstrBot plugin, so development involves:
 - **Main class**: `SoupaiPlugin(Star)`, picked up by AstrBot's auto-discovery.
   The `@register` decorator is deprecated — do not reintroduce it; identity
   lives in `metadata.yaml`.
+- **Lifecycle hooks are `initialize()` and `terminate()`, nothing else.**
+  `star_manager` only ever calls `await star_cls.initialize()` (no arguments),
+  and those two are the only hooks on `Star`. This was `async def init(self,
+  context)` for a while: no error anywhere, it simply never ran, so the web
+  routes were never registered (the page reported 「未找到该路由」) and auto
+  generation never started. `self.data_path` is set in `__init__` via
+  `StarTools.get_data_dir()`, so it does not need a later hook.
 - **Command handlers**: Decorated with `@filter.command`
 - **Session handlers**: Use `@session_waiter` for conversation flow
 - **LLM integration**: Go through `self._resolve_provider(provider_id, umo)`

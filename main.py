@@ -707,9 +707,15 @@ class SoupaiPlugin(Star):
             custom_file = self.data_path / "custom_soupai.json"
             self.custom_story_storage = CustomSoupaiStorage(custom_file, self.data_path)
 
-    async def init(self, context: Context):
-        """插件初始化，此时 self.data_path 可用"""
-        await super().init(context)
+    async def initialize(self):
+        """插件加载完成后由 AstrBot 调用。
+
+        必须叫 initialize：star_manager 只会 `await star_cls.initialize()`，
+        Star 基类上也只有 initialize / terminate 这一对。叫成别的名字不会
+        报错，只是永远不执行——网页接口注册不上（打开页面报「未找到该路由」），
+        自动出题也不会启动。
+        """
+        await super().initialize()
 
         # 初始化存储对象
         self._ensure_story_storages()
