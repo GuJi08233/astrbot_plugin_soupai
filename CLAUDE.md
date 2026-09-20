@@ -8,8 +8,8 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 
 ## Architecture
 
-- **Single-file plugin**: All functionality in `main.py` (1861 lines)
-- **AstrBot framework**: Built on AstrBot >= v3.4.36
+- **Single-file plugin**: All functionality in `main.py` (~2450 lines)
+- **AstrBot framework**: Built on AstrBot >= 4.16, < 5
 - **Thread-safe storage**: `ThreadSafeStoryStorage` class for managing puzzle usage
 - **Game state management**: `GameState` class tracks active games per group
 - **LLM integration**: Uses AstrBot's Provider interface for AI functionality
@@ -31,10 +31,19 @@ This is an AstrBot plugin, so development involves:
 
 ## Plugin Structure
 
-- **Main class**: Registered with `@register` decorator
+- **Main class**: `SoupaiPlugin(Star)`, picked up by AstrBot's auto-discovery.
+  The `@register` decorator is deprecated — do not reintroduce it; identity
+  lives in `metadata.yaml`.
 - **Command handlers**: Decorated with `@filter.command`
 - **Session handlers**: Use `@session_waiter` for conversation flow
-- **LLM integration**: Uses `self.context.get_using_provider()` and `self.context.get_provider_by_id()`
+- **LLM integration**: Go through `self._resolve_provider(provider_id, umo)`
+  rather than calling `get_using_provider` / `get_provider_by_id` directly —
+  it centralises the fallback and passes `umo` so per-session provider
+  isolation keeps working.
+- **Replies**: Send through `self._send_reply()` (honours the `reply_mode`
+  config) or `self._safe_send()` (swallows send failures). Do not call
+  `event.send(event.plain_result(...))` directly on paths that end a game.
+- **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 
 ## Important Patterns
 
@@ -52,7 +61,16 @@ This is an AstrBot plugin, so development involves:
 
 ## Key Files
 
-- `main.py:1-1861` - Core plugin implementation
+- `main.py` - Core plugin implementation
 - `network_soupai.json` - Puzzle database
-- `_conf_schema.json:1-49` - Configuration schema
-- `metadata.yaml:1-11` - Plugin metadata
+- `_conf_schema.json` - Configuration schema
+- `metadata.yaml` - Plugin metadata
+
+## Invariants Worth Keeping
+
+- **Clear game state before sending the closing message.** `event.send`
+  raises when the platform is offline; if `end_game()` runs after it, the
+  round stays "active" forever and `/汤` can never start a new one.
+- **Never echo the verification LLM's critique on a wrong guess.** To explain
+  the mistake it retells the answer. Use the `_LEVEL_FEEDBACK` table instead.
+- Format with `ruff check --fix && ruff format` before committing.
