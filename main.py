@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import random
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,70 +22,223 @@ from astrbot.core.utils.session_waiter import (
     session_waiter,
 )
 
+from .webui import SoupaiWebApi
+
+# 未提供会话标识时归入的记录桶，例如后台任务取题
+DEFAULT_SESSION = "__default__"
+
 
 # 线程安全的题库管理基类
 class ThreadSafeStoryStorage:
-    """线程安全的题库管理基类，支持持久化使用记录"""
+    """线程安全的题库管理基类，按会话分别记录哪些题已经出过。
+
+    使用记录保存的是故事 id 而非下标：下标会因为增删题目而整体偏移，
+    本地库存满后的 pop(0) 和网页端的删除都会让记录张冠李戴。
+    """
 
     def __init__(self, storage_name: str, data_path=None):
         self.storage_name = storage_name
         self.data_path = data_path
-        self.used_indexes: set[int] = set()
-        self.lock = threading.Lock()  # 线程锁
+        self.stories: list[dict] = []
+        # 会话标识 -> 该会话已出过的故事 id
+        self.usage: dict[str, set[str]] = {}
+        # 被隐藏的故事 id，用于在不改动只读题库文件的前提下屏蔽某些题
+        self.hidden_ids: set[str] = set()
+        self.lock = threading.RLock()
         self.usage_file = (
             self.data_path / f"{storage_name}_usage.json" if self.data_path else None
         )
+        self.hidden_file = (
+            self.data_path / f"{storage_name}_hidden.json" if self.data_path else None
+        )
         self.load_usage_record()
+        self.load_hidden_record()
+
+    # ------------------------------------------------------------------ id
+
+    def story_id(self, story: dict, index: int) -> str:
+        """故事的稳定标识。没有 id 字段的（只读的网络题库）退化为下标。"""
+        sid = story.get("id") if isinstance(story, dict) else None
+        return str(sid) if sid else str(index)
+
+    def _assign_missing_ids(self) -> bool:
+        """给缺少 id 的故事补一个，返回是否产生了改动。"""
+        changed = False
+        for story in self.stories:
+            if isinstance(story, dict) and not story.get("id"):
+                story["id"] = uuid.uuid4().hex[:12]
+                changed = True
+        return changed
+
+    def find_index(self, story_id: str) -> int:
+        """按 id 查下标，找不到返回 -1。"""
+        for i, story in enumerate(self.stories):
+            if self.story_id(story, i) == str(story_id):
+                return i
+        return -1
+
+    # --------------------------------------------------------------- usage
 
     def load_usage_record(self):
-        """从文件加载使用记录"""
-        if not self.usage_file:
-            self.used_indexes = set()
+        """加载使用记录。旧版的扁平列表格式会被备份后丢弃。"""
+        self.usage = {}
+        if not self.usage_file or not self.usage_file.exists():
             return
-
         try:
-            if self.usage_file.exists():
-                with open(self.usage_file, encoding="utf-8") as f:
-                    self.used_indexes = set(json.load(f))
-                logger.info(
-                    f"从 {self.usage_file} 加载了 {len(self.used_indexes)} 个使用记录"
-                )
-            else:
-                self.used_indexes = set()
-                logger.info(f"使用记录文件不存在，创建新的记录: {self.usage_file}")
+            with open(self.usage_file, encoding="utf-8") as f:
+                raw = json.load(f)
         except Exception as e:
             logger.error(f"加载使用记录失败: {e}")
-            self.used_indexes = set()
+            return
+
+        if isinstance(raw, list):
+            # v1 的全局记录按下标存储，换成按会话+id 之后无法对应，
+            # 备份原文件后从空记录重新开始
+            backup = self.usage_file.with_suffix(".v1.json")
+            try:
+                self.usage_file.replace(backup)
+                logger.warning(
+                    f"{self.storage_name} 的使用记录是旧版全局格式，已备份到 {backup.name} "
+                    f"并重置为按会话记录"
+                )
+            except Exception as e:
+                logger.error(f"备份旧版使用记录失败: {e}")
+            return
+
+        if isinstance(raw, dict):
+            self.usage = {
+                str(session): {str(i) for i in ids}
+                for session, ids in raw.items()
+                if isinstance(ids, list)
+            }
+            total = sum(len(v) for v in self.usage.values())
+            logger.info(
+                f"从 {self.usage_file.name} 加载了 {len(self.usage)} 个会话、共 {total} 条使用记录"
+            )
 
     def save_usage_record(self):
         """保存使用记录到文件"""
         if not self.usage_file:
             return
-
         try:
             self.usage_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {s: sorted(ids) for s, ids in self.usage.items() if ids}
             with open(self.usage_file, "w", encoding="utf-8") as f:
-                json.dump(list(self.used_indexes), f, ensure_ascii=False, indent=2)
-            logger.info(
-                f"保存了 {len(self.used_indexes)} 个使用记录到 {self.usage_file}"
-            )
+                json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存使用记录失败: {e}")
 
-    def reset_usage(self):
-        """重置使用记录"""
+    def used_ids(self, session: str) -> set[str]:
+        """某个会话已出过的故事 id"""
         with self.lock:
-            self.used_indexes.clear()
-            self.save_usage_record()
-            logger.info(f"{self.storage_name} 使用记录已重置")
+            return set(self.usage.get(session or DEFAULT_SESSION, set()))
 
-    def get_usage_info(self) -> dict:
-        """获取使用记录信息"""
+    def mark_used(self, session: str, story_id: str) -> None:
         with self.lock:
-            return {
-                "used": len(self.used_indexes),
-                "used_indexes": list(self.used_indexes),
-            }
+            self.usage.setdefault(session or DEFAULT_SESSION, set()).add(str(story_id))
+            self.save_usage_record()
+
+    def unmark_used(self, session: str, story_id: str) -> None:
+        with self.lock:
+            self.usage.get(session or DEFAULT_SESSION, set()).discard(str(story_id))
+            self.save_usage_record()
+
+    def reset_usage(self, session: str | None = None):
+        """重置使用记录。不指定会话则清空所有会话。"""
+        with self.lock:
+            if session is None:
+                self.usage.clear()
+                logger.info(f"{self.storage_name} 全部会话的使用记录已重置")
+            else:
+                self.usage.pop(session, None)
+                logger.info(f"{self.storage_name} 会话 {session} 的使用记录已重置")
+            self.save_usage_record()
+
+    def sessions(self) -> list[str]:
+        with self.lock:
+            return sorted(s for s, ids in self.usage.items() if ids)
+
+    def get_usage_info(self, session: str | None = None) -> dict:
+        """获取使用记录信息。不指定会话则统计所有会话去重后的总量。"""
+        with self.lock:
+            if session is None:
+                merged: set[str] = set()
+                for ids in self.usage.values():
+                    merged |= ids
+            else:
+                merged = set(self.usage.get(session, set()))
+            return {"used": len(merged), "used_ids": sorted(merged)}
+
+    # -------------------------------------------------------------- hidden
+
+    def load_hidden_record(self):
+        self.hidden_ids = set()
+        if not self.hidden_file or not self.hidden_file.exists():
+            return
+        try:
+            with open(self.hidden_file, encoding="utf-8") as f:
+                self.hidden_ids = {str(i) for i in json.load(f)}
+            if self.hidden_ids:
+                logger.info(f"{self.storage_name} 有 {len(self.hidden_ids)} 道题被屏蔽")
+        except Exception as e:
+            logger.error(f"加载屏蔽名单失败: {e}")
+
+    def save_hidden_record(self):
+        if not self.hidden_file:
+            return
+        try:
+            self.hidden_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.hidden_file, "w", encoding="utf-8") as f:
+                json.dump(sorted(self.hidden_ids), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存屏蔽名单失败: {e}")
+
+    def set_hidden(self, story_id: str, hidden: bool) -> None:
+        with self.lock:
+            if hidden:
+                self.hidden_ids.add(str(story_id))
+            else:
+                self.hidden_ids.discard(str(story_id))
+            self.save_hidden_record()
+
+    # ---------------------------------------------------------------- pick
+
+    def pick_story(self, session: str) -> tuple[str, str] | None:
+        """为某个会话取一道没出过、也没被屏蔽的题。
+
+        该会话把可用的题出完后，只重置这个会话的记录，不影响其他会话。
+        """
+        with self.lock:
+            if not self.stories:
+                return None
+
+            used = self.usage.setdefault(session or DEFAULT_SESSION, set())
+            candidates = [
+                (i, s)
+                for i, s in enumerate(self.stories)
+                if self.story_id(s, i) not in self.hidden_ids
+            ]
+            if not candidates:
+                return None
+
+            available = [
+                (i, s) for i, s in candidates if self.story_id(s, i) not in used
+            ]
+            if not available:
+                logger.info(
+                    f"{self.storage_name} 对会话 {session} 已出完，清空该会话记录重新开始"
+                )
+                used.clear()
+                available = candidates
+
+            index, story = random.choice(available)
+            used.add(self.story_id(story, index))
+            self.save_usage_record()
+            logger.info(
+                f"{self.storage_name} 取题 id={self.story_id(story, index)}，"
+                f"该会话已出 {len(used)}/{len(candidates)}"
+            )
+            return story["puzzle"], story["answer"]
 
 
 # 游戏状态管理
@@ -147,46 +302,18 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
             logger.error(f"加载网络海龟汤失败: {e}")
             self.stories = []
 
-    def get_story(self) -> tuple[str, str] | None:
-        """从网络题库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
+    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
+        """为指定会话取一道网络题"""
+        return self.pick_story(session)
 
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("网络题库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从网络题库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> dict:
+    def get_storage_info(self, session: str | None = None) -> dict:
         """获取网络题库信息"""
-        usage_info = self.get_usage_info()
+        usage_info = self.get_usage_info(session)
+        total = len(self.stories)
         return {
-            "total": len(self.stories),
-            "available": len(self.stories) - usage_info["used"],
+            "total": total,
+            "hidden": len(self.hidden_ids),
+            "available": total - len(self.hidden_ids) - usage_info["used"],
             "used": usage_info["used"],
         }
 
@@ -213,6 +340,8 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
                 with open(storage_path, encoding="utf-8") as f:
                     self.stories = json.load(f)
                 logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个故事")
+                if self._assign_missing_ids():
+                    self.save_stories()
             else:
                 self.stories = []
                 logger.info("存储库文件不存在，创建新的存储库")
@@ -240,60 +369,37 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
         """添加故事到存储库"""
         with self.lock:
             if len(self.stories) >= self.max_size:
-                # 移除最旧的故事
-                self.stories.pop(0)
+                # 移除最旧的故事。使用记录按 id 保存，不会因此错位
+                dropped = self.stories.pop(0)
                 logger.info("存储库已满，移除最旧的故事")
+                dropped_id = dropped.get("id")
+                if dropped_id:
+                    for ids in self.usage.values():
+                        ids.discard(str(dropped_id))
 
             story = {
+                "id": uuid.uuid4().hex[:12],
                 "puzzle": puzzle,
                 "answer": answer,
                 "created_at": datetime.now().isoformat(),
             }
             self.stories.append(story)
             self.save_stories()
+            self.save_usage_record()
             logger.info(f"添加新故事到存储库，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self) -> tuple[str, str] | None:
-        """从存储库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
+    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
+        """为指定会话取一道本地题"""
+        return self.pick_story(session)
 
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("本地存储库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从本地存储库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> dict:
+    def get_storage_info(self, session: str | None = None) -> dict:
         """获取存储库信息"""
-        usage_info = self.get_usage_info()
+        usage_info = self.get_usage_info(session)
         return {
             "total": len(self.stories),
             "max_size": self.max_size,
+            "hidden": len(self.hidden_ids),
             "available": self.max_size - len(self.stories),
             "used": usage_info["used"],
             "remaining": len(self.stories) - usage_info["used"],
@@ -323,6 +429,8 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
                 logger.info(
                     f"从 {storage_path} 加载了 {len(self.stories)} 个自定义海龟汤故事"
                 )
+                if self._assign_missing_ids():
+                    self.save_stories()
             else:
                 self.stories = []
                 logger.info("自定义海龟汤文件不存在，创建新的存储库")
@@ -352,6 +460,7 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
         """添加自定义故事到存储库"""
         with self.lock:
             story = {
+                "id": uuid.uuid4().hex[:12],
                 "puzzle": puzzle,
                 "answer": answer,
                 "created_at": datetime.now().isoformat(),
@@ -361,45 +470,16 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             logger.info(f"添加新自定义海龟汤故事，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self) -> tuple[str, str] | None:
-        """从自定义存储库获取一个故事，避免重复（线程安全）"""
-        if not self.stories:
-            return None
+    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
+        """为指定会话取一道自定义题"""
+        return self.pick_story(session)
 
-        with self.lock:
-            # 获取所有可用的索引（排除已使用的）
-            available_indexes = [
-                i for i in range(len(self.stories)) if i not in self.used_indexes
-            ]
-
-            # 如果没有可用题目，清空已用记录，重新开始一轮
-            if not available_indexes:
-                logger.info("自定义存储库已全部使用完毕，清空记录重新开始")
-                self.used_indexes.clear()
-                available_indexes = list(range(len(self.stories)))
-                # 立即保存重置后的状态
-                self.save_usage_record()
-
-            # 从可用索引中随机选择一个
-            import random
-
-            selected = random.choice(available_indexes)
-            self.used_indexes.add(selected)
-
-            # 保存使用记录
-            self.save_usage_record()
-
-            story = self.stories[selected]
-            logger.info(
-                f"从自定义存储库获取故事，索引: {selected}, 已使用: {len(self.used_indexes)}/{len(self.stories)}"
-            )
-            return story["puzzle"], story["answer"]
-
-    def get_storage_info(self) -> dict:
+    def get_storage_info(self, session: str | None = None) -> dict:
         """获取自定义存储库信息"""
-        usage_info = self.get_usage_info()
+        usage_info = self.get_usage_info(session)
         return {
             "total": len(self.stories),
+            "hidden": len(self.hidden_ids),
             "used": usage_info["used"],
             "remaining": len(self.stories) - usage_info["used"],
         }
@@ -570,6 +650,13 @@ class SoupaiPlugin(Star):
 
         # 初始化存储对象
         self._ensure_story_storages()
+
+        # 注册网页管理接口，对应 pages/dashboard 那个页面
+        try:
+            self.web_api = SoupaiWebApi(self)
+            self.web_api.register()
+        except Exception as e:
+            logger.error(f"注册网页管理接口失败，网页端将不可用: {e}")
 
         # 启动自动生成任务
         asyncio.create_task(self._start_auto_generate())
@@ -1337,10 +1424,15 @@ class SoupaiPlugin(Star):
                 # 没有参数，使用配置的策略随机获取
                 source_type = "current"
 
+            # 出过的题按会话记录，不同群、私聊各自独立
+            session = event.unified_msg_origin
+
             # 根据解析的参数获取故事
             if puzzle_index is not None:
                 # 指定了题号，从特定题库获取
-                story = await self.get_story_by_index(source_type, puzzle_index)
+                story = await self.get_story_by_index(
+                    source_type, puzzle_index, session
+                )
                 if not story:
                     yield event.plain_result(
                         f"{source_type}题库中没有第 {puzzle_index} 号题目"
@@ -1351,22 +1443,19 @@ class SoupaiPlugin(Star):
                 # 没有指定题号，根据策略随机获取
                 if source_type == "current":
                     # 使用配置的策略获取随机故事
-                    strategy = self.puzzle_source_strategy
-                    story = await self.get_story_by_strategy(strategy)
+                    story = await self.get_story_by_strategy(
+                        self.puzzle_source_strategy, session
+                    )
                 else:
                     # 从指定题库获取随机故事
-                    if source_type == "network":
-                        story = self.online_story_storage.get_story()
-                    elif source_type == "local":
-                        story = self.local_story_storage.get_story()
-                    elif source_type == "custom":
-                        story = self.custom_story_storage.get_story()
-                    else:
+                    storage = self._storage_of(source_type)
+                    if storage is None:
                         yield event.plain_result(
                             "题库类型参数错误，请使用 network/local/custom"
                         )
                         self.generating_games.discard(group_id)
                         return
+                    story = storage.get_story(session)
 
             if not story:
                 yield event.plain_result("获取谜题失败，请重试")
@@ -1397,6 +1486,10 @@ class SoupaiPlugin(Star):
                 accept_levels=diff_conf["accept_levels"],
                 hint_limit=diff_conf.get("hint_limit"),
                 hint_count=0,
+                # 对局以 group_id 为键，但使用记录按 unified_msg_origin 归档，
+                # 网页端靠这个字段把两者对上
+                session=session,
+                started_at=datetime.now().isoformat(),
             ):
                 extra = ""
                 if diff_conf["limit"] is not None:
@@ -1740,321 +1833,77 @@ class SoupaiPlugin(Star):
                 return True
         return False
 
-    async def get_story_by_strategy(self, strategy: str) -> tuple[str, str] | None:
-        """根据策略获取故事，返回 (puzzle, answer) 或 None"""
-        import random
+    # 每个策略对应的题库尝试顺序，取不到再往后退一档
+    _SOURCE_ORDER = {
+        "network_first": ("network", "local", "custom"),
+        "local_first": ("local", "network", "custom"),
+        "custom_first": ("custom", "local", "network"),
+    }
 
+    def _storage_of(self, source: str):
+        """按名字取题库对象"""
+        self._ensure_story_storages()
+        return {
+            "network": self.online_story_storage,
+            "local": self.local_story_storage,
+            "custom": self.custom_story_storage,
+        }.get(source)
+
+    async def get_story_by_strategy(
+        self, strategy: str, session: str = DEFAULT_SESSION
+    ) -> tuple[str, str] | None:
+        """按策略为指定会话取题，三个题库都取不到时让 LLM 现场生成。"""
         self._ensure_story_storages()
 
-        if strategy == "network_first":
-            # 策略1：优先网络题库 -> 本地存储库 -> 自定义题库 -> LLM现场生成
+        if strategy == "random":
+            strategy = random.choice(list(self._SOURCE_ORDER))
+        order = self._SOURCE_ORDER.get(strategy)
+        if order is None:
+            return None
 
-            # 1. 检查网络题库
-            story = self.online_story_storage.get_story()
+        for source in order:
+            story = self._storage_of(source).get_story(session)
             if story:
                 return story
-
-            # 2. 检查本地存储库
-            story = self.local_story_storage.get_story()
-            if story:
-                return story
-
-            # 3. 检查自定义题库
-            story = self.custom_story_storage.get_story()
-            if story:
-                return story
-
-            # 4. LLM现场生成
-            return await self.generate_story_with_llm()
-
-        elif strategy == "local_first":
-            # 策略2：优先本地存储库 -> 网络题库 -> 自定义题库 -> LLM现场生成
-
-            # 1. 检查本地存储库
-            story = self.local_story_storage.get_story()
-            if story:
-                return story
-
-            # 2. 检查网络题库
-            story = self.online_story_storage.get_story()
-            if story:
-                return story
-
-            # 3. 检查自定义题库
-            story = self.custom_story_storage.get_story()
-            if story:
-                return story
-
-            # 4. LLM现场生成
-            return await self.generate_story_with_llm()
-
-        elif strategy == "custom_first":
-            # 策略3：优先自定义题库 -> 本地存储库 -> 网络题库 -> LLM现场生成
-
-            # 1. 检查自定义题库
-            story = self.custom_story_storage.get_story()
-            if story:
-                return story
-
-            # 2. 检查本地存储库
-            story = self.local_story_storage.get_story()
-            if story:
-                return story
-
-            # 3. 检查网络题库
-            story = self.online_story_storage.get_story()
-            if story:
-                return story
-
-            # 4. LLM现场生成
-            return await self.generate_story_with_llm()
-
-        elif strategy == "random":
-            # 策略3：随机选择网络题库、本地存储库或自定义题库，失败时使用LLM现场生成
-
-            # 随机决定这次从哪个题库获取
-            choice = random.choice(["network", "local", "custom"])
-            if choice == "network":
-                # 参考策略1的网络题库逻辑
-                story = self.online_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.local_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.custom_story_storage.get_story()
-                if story:
-                    return story
-
-                return await self.generate_story_with_llm()
-            elif choice == "local":
-                # 参考策略2的本地存储库逻辑
-                story = self.local_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.online_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.custom_story_storage.get_story()
-                if story:
-                    return story
-
-                return await self.generate_story_with_llm()
-            else:  # custom
-                # 优先自定义题库
-                story = self.custom_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.local_story_storage.get_story()
-                if story:
-                    return story
-
-                story = self.online_story_storage.get_story()
-                if story:
-                    return story
-
-                return await self.generate_story_with_llm()
-
-        return None
+        return await self.generate_story_with_llm()
 
     async def get_story_by_index(
-        self, source_type: str, index: int
+        self, source_type: str, index: int, session: str = DEFAULT_SESSION
     ) -> tuple[str, str] | None:
         """根据索引获取特定故事
 
         Args:
             source_type: "network" - 网络题库, "current" - 当前策略题库, "custom" - 自定义题库
             index: 题目索引（从0开始）
+            session: 会话标识，取到的题记在这个会话名下
 
         Returns:
             (puzzle, answer) 或 None
         """
         self._ensure_story_storages()
 
-        if source_type == "network":
-            # 从网络题库获取指定索引的故事
-            if index < 0 or index >= len(self.online_story_storage.stories):
-                return None
-
-            story = self.online_story_storage.stories[index]
-            # 标记为已使用
-            with self.online_story_storage.lock:
-                self.online_story_storage.used_indexes.add(index)
-                self.online_story_storage.save_usage_record()
-
-            logger.info(f"从网络题库获取指定故事，索引: {index}")
-            return story["puzzle"], story["answer"]
-
-        elif source_type == "custom":
-            # 从自定义题库获取指定索引的故事
-            if index < 0 or index >= len(self.custom_story_storage.stories):
-                return None
-
-            story = self.custom_story_storage.stories[index]
-            # 标记为已使用
-            with self.custom_story_storage.lock:
-                self.custom_story_storage.used_indexes.add(index)
-                self.custom_story_storage.save_usage_record()
-
-            logger.info(f"从自定义题库获取指定故事，索引: {index}")
-            return story["puzzle"], story["answer"]
-
+        if source_type in ("network", "custom", "local"):
+            order = (source_type,)
         elif source_type == "current":
-            # 根据当前策略获取指定索引的故事
+            # 把各题库按策略顺序串成一个连续的索引空间
             strategy = self.puzzle_source_strategy
+            order = self._SOURCE_ORDER.get(
+                strategy, self._SOURCE_ORDER["network_first"]
+            )
+        else:
+            return None
 
-            if strategy == "network_first":
-                # 优先检查网络题库
-                if index < len(self.online_story_storage.stories):
-                    story = self.online_story_storage.stories[index]
-                    with self.online_story_storage.lock:
-                        self.online_story_storage.used_indexes.add(index)
-                        self.online_story_storage.save_usage_record()
-                    logger.info(f"从网络题库获取指定故事，索引: {index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查本地存储库
-                local_index = index - len(self.online_story_storage.stories)
-                if local_index >= 0 and local_index < len(
-                    self.local_story_storage.stories
-                ):
-                    story = self.local_story_storage.stories[local_index]
-                    with self.local_story_storage.lock:
-                        self.local_story_storage.used_indexes.add(local_index)
-                        self.local_story_storage.save_usage_record()
-                    logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查自定义题库
-                custom_index = local_index - len(self.local_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(
-                    self.custom_story_storage.stories
-                ):
-                    story = self.custom_story_storage.stories[custom_index]
-                    with self.custom_story_storage.lock:
-                        self.custom_story_storage.used_indexes.add(custom_index)
-                        self.custom_story_storage.save_usage_record()
-                    logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 超出范围，返回None
-                return None
-
-            elif strategy == "local_first":
-                # 优先检查本地存储库
-                if index < len(self.local_story_storage.stories):
-                    story = self.local_story_storage.stories[index]
-                    with self.local_story_storage.lock:
-                        self.local_story_storage.used_indexes.add(index)
-                        self.local_story_storage.save_usage_record()
-                    logger.info(f"从本地存储库获取指定故事，索引: {index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查网络题库
-                network_index = index - len(self.local_story_storage.stories)
-                if network_index >= 0 and network_index < len(
-                    self.online_story_storage.stories
-                ):
-                    story = self.online_story_storage.stories[network_index]
-                    with self.online_story_storage.lock:
-                        self.online_story_storage.used_indexes.add(network_index)
-                        self.online_story_storage.save_usage_record()
-                    logger.info(f"从网络题库获取指定故事，索引: {network_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查自定义题库
-                custom_index = network_index - len(self.online_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(
-                    self.custom_story_storage.stories
-                ):
-                    story = self.custom_story_storage.stories[custom_index]
-                    with self.custom_story_storage.lock:
-                        self.custom_story_storage.used_indexes.add(custom_index)
-                        self.custom_story_storage.save_usage_record()
-                    logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 超出范围，返回None
-                return None
-
-            elif strategy == "custom_first":
-                # 优先检查自定义题库
-                if index < len(self.custom_story_storage.stories):
-                    story = self.custom_story_storage.stories[index]
-                    with self.custom_story_storage.lock:
-                        self.custom_story_storage.used_indexes.add(index)
-                        self.custom_story_storage.save_usage_record()
-                    logger.info(f"从自定义题库获取指定故事，索引: {index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查本地存储库
-                local_index = index - len(self.custom_story_storage.stories)
-                if local_index >= 0 and local_index < len(
-                    self.local_story_storage.stories
-                ):
-                    story = self.local_story_storage.stories[local_index]
-                    with self.local_story_storage.lock:
-                        self.local_story_storage.used_indexes.add(local_index)
-                        self.local_story_storage.save_usage_record()
-                    logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 然后检查网络题库
-                network_index = local_index - len(self.local_story_storage.stories)
-                if network_index >= 0 and network_index < len(
-                    self.online_story_storage.stories
-                ):
-                    story = self.online_story_storage.stories[network_index]
-                    with self.online_story_storage.lock:
-                        self.online_story_storage.used_indexes.add(network_index)
-                        self.online_story_storage.save_usage_record()
-                    logger.info(f"从网络题库获取指定故事，索引: {network_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 超出范围，返回None
-                return None
-
-            elif strategy == "random":
-                # 对于随机策略，我们无法准确知道索引对应哪个题库
-                # 这里我们按顺序检查：先网络题库，再本地存储库，最后自定义题库
-                if index < len(self.online_story_storage.stories):
-                    story = self.online_story_storage.stories[index]
-                    with self.online_story_storage.lock:
-                        self.online_story_storage.used_indexes.add(index)
-                        self.online_story_storage.save_usage_record()
-                    logger.info(f"从网络题库获取指定故事，索引: {index}")
-                    return story["puzzle"], story["answer"]
-
-                local_index = index - len(self.online_story_storage.stories)
-                if local_index >= 0 and local_index < len(
-                    self.local_story_storage.stories
-                ):
-                    story = self.local_story_storage.stories[local_index]
-                    with self.local_story_storage.lock:
-                        self.local_story_storage.used_indexes.add(local_index)
-                        self.local_story_storage.save_usage_record()
-                    logger.info(f"从本地存储库获取指定故事，索引: {local_index}")
-                    return story["puzzle"], story["answer"]
-
-                custom_index = local_index - len(self.local_story_storage.stories)
-                if custom_index >= 0 and custom_index < len(
-                    self.custom_story_storage.stories
-                ):
-                    story = self.custom_story_storage.stories[custom_index]
-                    with self.custom_story_storage.lock:
-                        self.custom_story_storage.used_indexes.add(custom_index)
-                        self.custom_story_storage.save_usage_record()
-                    logger.info(f"从自定义题库获取指定故事，索引: {custom_index}")
-                    return story["puzzle"], story["answer"]
-
-                # 超出范围，返回None
-                return None
-
+        offset = index
+        if offset < 0:
+            return None
+        for source in order:
+            storage = self._storage_of(source)
+            if offset < len(storage.stories):
+                story = storage.stories[offset]
+                storage.mark_used(session, storage.story_id(story, offset))
+                logger.info(f"从 {source} 题库获取指定故事，索引: {offset}")
+                return story["puzzle"], story["answer"]
+            offset -= len(storage.stories)
         return None
 
     async def _handle_game_status_in_session(
@@ -2410,27 +2259,30 @@ class SoupaiPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置题库")
-    async def reset_story_storage(self, event: AstrMessageEvent):
-        """重置题库使用记录（仅管理员）"""
+    async def reset_story_storage(self, event: AstrMessageEvent, scope: str = ""):
+        """重置题库使用记录（仅管理员）。加 all 参数可重置全部会话"""
 
         self._ensure_story_storages()
 
-        # 重置网络题库使用记录
-        self.online_story_storage.reset_usage()
-        online_info = self.online_story_storage.get_storage_info()
-
-        # 重置本地存储库使用记录
-        self.local_story_storage.reset_usage()
-        local_info = self.local_story_storage.get_storage_info()
-
-        message = (
-            f"✅ 题库使用记录已重置！\n"
-            f"• 网络题库：{online_info['total']} 个谜题 (已重置)\n"
-            f"• 本地存储库：{local_info['total']} 个谜题 (已重置)\n"
-            f"• 所有题目现在都可以重新使用"
+        storages = (
+            self.online_story_storage,
+            self.local_story_storage,
+            self.custom_story_storage,
         )
+        all_sessions = scope.strip().lower() in ("all", "全部")
+        session = None if all_sessions else event.unified_msg_origin
+        for storage in storages:
+            storage.reset_usage(session)
 
-        yield event.plain_result(message)
+        if all_sessions:
+            yield event.plain_result(
+                "✅ 已重置全部会话的题库使用记录，所有题目重新可用"
+            )
+        else:
+            yield event.plain_result(
+                "✅ 已重置本会话的题库使用记录，所有题目在这里重新可用\n"
+                "💡 其他群/私聊的记录不受影响，需要全部重置请用 /重置题库 all"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("题库详情")
@@ -2440,43 +2292,39 @@ class SoupaiPlugin(Star):
         # 确保题库已初始化
         self._ensure_story_storages()
 
-        # 获取网络题库详细信息
-        online_info = self.online_story_storage.get_storage_info()
-        online_usage = self.online_story_storage.get_usage_info()
+        session = event.unified_msg_origin
+        lines = ["📊 题库使用记录（本会话）：", ""]
 
-        # 获取本地存储库详细信息
-        local_info = self.local_story_storage.get_storage_info()
-        local_usage = self.local_story_storage.get_usage_info()
+        for label, storage in (
+            ("🌐 网络题库", self.online_story_storage),
+            ("💾 本地存储库", self.local_story_storage),
+            ("✏️ 自定义题库", self.custom_story_storage),
+        ):
+            here = storage.get_storage_info(session)
+            total = here["total"]
+            hidden = here.get("hidden", 0)
+            usable = total - hidden
+            rate = (here["used"] / usable * 100) if usable > 0 else 0.0
+            all_used = storage.get_usage_info()["used"]
+            lines.append(label + "：")
+            lines.append(
+                f"• 总数：{total} 个" + (f"（屏蔽 {hidden} 个）" if hidden else "")
+            )
+            lines.append(f"• 本会话已出：{here['used']} 个（{rate:.0f}%）")
+            lines.append(f"• 本会话剩余：{max(usable - here['used'], 0)} 个")
+            lines.append(f"• 所有会话共出过：{all_used} 个")
+            lines.append("")
 
-        # 安全计算使用率，避免除零错误
-        online_usage_rate = (
-            (online_info["used"] / online_info["total"] * 100)
-            if online_info["total"] > 0
-            else 0.0
-        )
-        local_usage_rate = (
-            (local_info["used"] / local_info["total"] * 100)
-            if local_info["total"] > 0
-            else 0.0
-        )
+        sessions = set()
+        for storage in (
+            self.online_story_storage,
+            self.local_story_storage,
+            self.custom_story_storage,
+        ):
+            sessions.update(storage.sessions())
+        lines.append(f"🗂 共有 {len(sessions)} 个会话出过题，各自独立计数")
 
-        message = (
-            f"📊 题库详细使用记录：\n\n"
-            f"🌐 网络题库：\n"
-            f"• 总数：{online_info['total']} 个谜题\n"
-            f"• 已使用：{online_info['used']} 个\n"
-            f"• 剩余：{online_info['available']} 个\n"
-            f"• 使用率：{online_usage_rate:.1f}%\n"
-            f"• 已用索引：{online_usage['used_indexes'][:10]}{'...' if len(online_usage['used_indexes']) > 10 else ''}\n\n"
-            f"💾 本地存储库：\n"
-            f"• 总数：{local_info['total']} 个谜题\n"
-            f"• 已使用：{local_info['used']} 个\n"
-            f"• 剩余：{local_info['remaining']} 个\n"
-            f"• 使用率：{local_usage_rate:.1f}%\n"
-            f"• 已用索引：{local_usage['used_indexes'][:10]}{'...' if len(local_usage['used_indexes']) > 10 else ''}"
-        )
-
-        yield event.plain_result(message)
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("提示")
     async def hint_command(self, event: AstrMessageEvent):

@@ -73,6 +73,20 @@ This is an AstrBot plugin, so development involves:
 - `_conf_schema.json` - Configuration schema
 - `metadata.yaml` - Plugin metadata
 
+## Web UI
+
+`webui.py` registers the routes behind the panel page in `pages/dashboard/`.
+AstrBot loads that page in an iframe with no auth of its own, so the page talks
+to the backend by posting `astrbot-plugin-page` messages to the parent window.
+That bridge implements only `api:get` and `api:post` — do not add PUT/DELETE
+routes, they cannot be reached. Handlers return `{"status": "ok", "data": ...}`;
+the bridge unwraps `data` before the page sees it.
+
+`network_soupai.json` ships with the repo, so the network bank is read-only
+from the web: editing it would dirty the working tree and conflict when merging
+upstream. Hiding a puzzle writes to a blocklist under the plugin data dir
+instead.
+
 ## Invariants Worth Keeping
 
 - **Clear game state before sending the closing message.** `event.send`
@@ -85,4 +99,13 @@ This is an AstrBot plugin, so development involves:
   literal text `完全还原` scored 完全还原 at 0.87 confidence and won the round.
   A Score primitive is fooled the same way. Verdicts are safe — winning a
   bogus 「是」 does not end the game.
+- **Usage records key on story id, never on list position.** Positions shift
+  when the local bank evicts its oldest entry or the web UI deletes something,
+  which silently reassigns "already used" to a different puzzle.
+- **Usage is per session (`unified_msg_origin`), not global.** Each group and
+  DM works through the bank independently. Games are still keyed by `group_id`,
+  so each game carries a `session` field to tie the two together — keep writing
+  it in `start_game`, the web UI relies on it.
+- **Never put an answer in a list response.** `stories` and `games` return
+  puzzles only; `story/answer` is a separate, deliberate request.
 - Format with `ruff check --fix && ruff format` before committing.

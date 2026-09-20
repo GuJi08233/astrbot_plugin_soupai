@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>海龟汤管理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="toast" class="toast" hidden></div>
+
+<header class="topbar">
+  <div class="tabs">
+    <button class="tab is-active" data-tab="stories">题库</button>
+    <button class="tab" data-tab="sessions">会话</button>
+    <button class="tab" data-tab="games">对局</button>
+  </div>
+  <button id="refresh" class="btn btn-ghost" title="刷新">刷新</button>
+</header>
+
+<!-- ─────────────── 题库 ─────────────── -->
+<section class="panel" data-panel="stories">
+  <div class="stat-row" id="statRow"></div>
+
+  <div class="toolbar">
+    <div class="seg" id="sourceSeg"></div>
+    <input id="search" class="input" type="search" placeholder="搜索汤面…">
+    <label class="check" title="搜索汤底会在列表里显示匹配的汤底片段，可能剧透">
+      <input type="checkbox" id="searchAnswer"> 含汤底
+    </label>
+    <select id="sessionFilter" class="input input-sm" title="按会话查看出题情况"></select>
+    <span class="grow"></span>
+    <button id="btnGenerate" class="btn">AI 生成</button>
+    <button id="btnCreate" class="btn btn-primary">新增</button>
+  </div>
+
+  <div id="list" class="list"></div>
+  <div class="pager">
+    <button id="prev" class="btn btn-ghost">上一页</button>
+    <span id="pageInfo" class="muted"></span>
+    <button id="next" class="btn btn-ghost">下一页</button>
+  </div>
+</section>
+
+<!-- ─────────────── 会话 ─────────────── -->
+<section class="panel" data-panel="sessions" hidden>
+  <p class="hint">每个群、每个私聊各自记录出过哪些题，互不影响。</p>
+  <div id="sessionList" class="list"></div>
+  <div class="toolbar">
+    <span class="grow"></span>
+    <button id="resetAll" class="btn btn-danger">重置全部会话记录</button>
+  </div>
+</section>
+
+<!-- ─────────────── 对局 ─────────────── -->
+<section class="panel" data-panel="games" hidden>
+  <p class="hint">进行中的对局。汤底不会显示在这里。</p>
+  <div id="gameList" class="list"></div>
+</section>
+
+<!-- ─────────────── 编辑弹窗 ─────────────── -->
+<div id="editor" class="modal" hidden>
+  <div class="modal-box">
+    <h3 id="editorTitle">新增题目</h3>
+    <label class="field">
+      <span>汤面</span>
+      <textarea id="editPuzzle" rows="4" placeholder="玩家看到的题面"></textarea>
+    </label>
+    <label class="field">
+      <span>汤底</span>
+      <textarea id="editAnswer" rows="7" placeholder="完整真相"></textarea>
+    </label>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-close>取消</button>
+      <button id="editSave" class="btn btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─────────────── 生成弹窗 ─────────────── -->
+<div id="genModal" class="modal" hidden>
+  <div class="modal-box">
+    <h3>用 LLM 生成新题</h3>
+    <p class="muted">生成的题目会存入本地存储库。使用你在插件配置里设置的「生成谜题的 LLM 服务商」。</p>
+    <label class="field">
+      <span>数量（1–5）</span>
+      <input id="genCount" class="input" type="number" min="1" max="5" value="1">
+    </label>
+    <div id="genResult" class="gen-result" hidden></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-close>关闭</button>
+      <button id="genRun" class="btn btn-primary">开始生成</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
