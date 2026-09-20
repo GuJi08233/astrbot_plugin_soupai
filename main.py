@@ -285,6 +285,53 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
         self.network_file = network_file
         self.stories: list[dict] = []
         self.load_stories()
+        self._drop_index_era_records()
+
+    def _drop_index_era_records(self) -> None:
+        """丢掉按下标记录的使用/屏蔽数据。
+
+        网络题库过去没有 id 字段，``story_id`` 退化成下标，于是记录里存的
+        是 "0"、"17" 这样的位置。题库去重后顺序整体变了，这些下标指向的
+        已经是另一道题——留着比清掉更糟，它会让没出过的题被当成出过。
+        对不上号，也就没法精确迁移，只能备份原文件后重来。
+        """
+
+        def is_index(sid: str) -> bool:
+            # 现在的 id 是 12 位十六进制，旧下标最多 3 位，不会误判
+            return sid.isdigit() and len(sid) < 12
+
+        with self.lock:
+            stale_usage = {
+                session: {sid for sid in ids if is_index(sid)}
+                for session, ids in self.usage.items()
+            }
+            stale_usage = {s: ids for s, ids in stale_usage.items() if ids}
+            stale_hidden = {sid for sid in self.hidden_ids if is_index(sid)}
+            if not stale_usage and not stale_hidden:
+                return
+
+            for path, drop in (
+                (self.usage_file, bool(stale_usage)),
+                (self.hidden_file, bool(stale_hidden)),
+            ):
+                if not drop or not path or not path.exists():
+                    continue
+                try:
+                    path.replace(path.with_suffix(".byindex.json"))
+                except Exception as e:
+                    logger.error(f"备份下标格式的 {path.name} 失败: {e}")
+
+            dropped = 0
+            for session, ids in stale_usage.items():
+                self.usage[session] -= ids
+                dropped += len(ids)
+            self.hidden_ids -= stale_hidden
+            self.save_usage_record()
+            self.save_hidden_record()
+            logger.warning(
+                f"{self.storage_name} 有 {dropped} 条使用记录、{len(stale_hidden)} 条屏蔽记录"
+                f"是按下标存的，题库加上 id 后已对不上号，已备份原文件并丢弃"
+            )
 
     def load_stories(self):
         """从文件加载网络海龟汤故事"""
