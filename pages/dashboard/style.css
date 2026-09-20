@@ -1,4 +1,8 @@
-/* 跟随 AstrBot 面板的明暗配色，不自带品牌色 */
+/* 跟随 AstrBot 面板的明暗配色，不自带品牌色。
+ *
+ * 深浅由 app.js 写在 <html data-theme> 上：面板会用 ?theme= 和 context
+ * 消息告诉我们它当前是深是浅，两者都没有时才退回系统偏好。直接用
+ * prefers-color-scheme 会在「面板深色 + 系统浅色」时整页发白。 */
 :root {
   --bg: #f6f7f9;
   --surface: #ffffff;
@@ -14,20 +18,18 @@
   --radius: 10px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #16181d;
-    --surface: #1e2127;
-    --border: #2f343d;
-    --text: #e6e8ea;
-    --muted: #9aa1ab;
-    --accent: #7b90f5;
-    --accent-text: #11131a;
-    --danger: #e26b6b;
-    --ok: #68c99a;
-    --used: #d9bb6a;
-    --used-bg: #3a331d;
-  }
+:root[data-theme="dark"] {
+  --bg: #16181d;
+  --surface: #1e2127;
+  --border: #2f343d;
+  --text: #e6e8ea;
+  --muted: #9aa1ab;
+  --accent: #7b90f5;
+  --accent-text: #11131a;
+  --danger: #e26b6b;
+  --ok: #68c99a;
+  --used: #d9bb6a;
+  --used-bg: #3a331d;
 }
 
 * { box-sizing: border-box; }
@@ -144,6 +146,23 @@ body {
 .pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 16px; }
 .empty { text-align: center; padding: 48px 0; color: var(--muted); }
 
+/* ── 加载骨架 ── */
+.skeleton {
+  height: 92px; border-radius: var(--radius);
+  border: 1px solid var(--border); background: var(--surface);
+  position: relative; overflow: hidden;
+}
+.skeleton::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, var(--bg), transparent);
+  opacity: .7; transform: translateX(-100%);
+  animation: skeleton-sweep 1.3s ease-in-out infinite;
+}
+@keyframes skeleton-sweep { to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after { animation: none; }
+}
+
 /* ── 弹窗 ── */
 .modal {
   position: fixed; inset: 0; background: rgba(0,0,0,.45);
@@ -155,7 +174,14 @@ body {
   width: min(620px, 100%); max-height: 90vh; overflow: auto;
 }
 .modal-box h3 { margin: 0 0 14px; }
+.modal-sm { width: min(420px, 100%); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.note {
+  margin: 0 0 14px; padding: 8px 11px; border-radius: 8px;
+  background: var(--used-bg); color: var(--used); font-size: 13px;
+}
+#confirmDetail { margin: 0; }
+#confirmDetail[hidden] { display: none; }
 .field { display: block; margin-bottom: 12px; }
 .field > span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 13px; }
 .field textarea {

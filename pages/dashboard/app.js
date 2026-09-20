@@ -3,42 +3,88 @@
  * 页面跑在 AstrBot 面板的 iframe 里，自身没有登录态，所以不能直接 fetch 后端，
  * 要通过 postMessage 让父窗口代发请求。桥只提供 api:get / api:post。
  *
+ * 发出去的每条消息都必须带 kind: 'request'，面板的 handleWindowMessage 只认
+ * 'ready' 和 'request' 两种，漏掉它消息会被静默丢弃，然后这里等到超时。
+ *
  * 汤底永远单独请求、且需要点一下才显示 —— 管理员翻题库时不该被剧透。
  */
 (() => {
   'use strict';
 
   const CHANNEL = 'astrbot-plugin-page';
+  const DEFAULT_TIMEOUT = 120000;
   const pending = new Map();
   let seq = 0;
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
-    if (!msg || msg.channel !== CHANNEL || msg.kind !== 'response') return;
+    if (!msg || msg.channel !== CHANNEL) return;
+
+    if (msg.kind === 'context') {
+      applyTheme(msg.context?.isDark ? 'dark' : 'light');
+      return;
+    }
+    if (msg.kind !== 'response') return;
+
     const slot = pending.get(msg.requestId);
     if (!slot) return;
+    clearTimeout(slot.timer);
     pending.delete(msg.requestId);
     msg.ok ? slot.resolve(msg.data) : slot.reject(new Error(msg.error || '请求失败'));
   });
 
-  function bridge(action, payload) {
+  function bridge(action, payload, timeout = DEFAULT_TIMEOUT) {
     return new Promise((resolve, reject) => {
       const requestId = `soupai-${Date.now()}-${++seq}`;
-      pending.set(requestId, { resolve, reject });
-      parent.postMessage({ channel: CHANNEL, requestId, action, ...payload }, '*');
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (pending.has(requestId)) {
           pending.delete(requestId);
           reject(new Error('请求超时'));
         }
-      }, 120000);
+      }, timeout);
+      pending.set(requestId, { resolve, reject, timer });
+      parent.postMessage(
+        { channel: CHANNEL, kind: 'request', requestId, action, ...payload },
+        '*',
+      );
     });
   }
 
   const api = {
-    get: (endpoint, params) => bridge('api:get', { endpoint, params: params || {} }),
-    post: (endpoint, body) => bridge('api:post', { endpoint, body: body || {} }),
+    get: (endpoint, params, timeout) =>
+      bridge('api:get', { endpoint, params: params || {} }, timeout),
+    post: (endpoint, body, timeout) =>
+      bridge('api:post', { endpoint, body: body || {} }, timeout),
   };
+
+  // ─────────────────────────────────────────── 主题
+  //
+  // 面板用两条路告诉我们它是深是浅：iframe 地址上的 ?theme=，以及 context
+  // 消息里的 isDark（切换主题时会再发一次）。都拿不到才退回系统偏好。
+
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)');
+  let themePinned = false;
+
+  function applyTheme(theme) {
+    themePinned = true;
+    document.documentElement.dataset.theme = theme;
+  }
+
+  function initTheme() {
+    const fromUrl = new URLSearchParams(location.search).get('theme');
+    if (fromUrl === 'dark' || fromUrl === 'light') {
+      applyTheme(fromUrl);
+    } else {
+      document.documentElement.dataset.theme = systemDark.matches ? 'dark' : 'light';
+    }
+    // 面板没发话时才跟着系统走，发过就以面板为准
+    systemDark.addEventListener('change', (e) => {
+      if (!themePinned) document.documentElement.dataset.theme = e.matches ? 'dark' : 'light';
+    });
+    // 面板在 iframe onload 时发一次 context，但那时这段可能还没跑完；
+    // 主动报 ready 让它补发，locale 变化时也靠这条链路
+    parent.postMessage({ channel: CHANNEL, kind: 'ready' }, '*');
+  }
 
   // ─────────────────────────────────────────── 状态
 
@@ -82,6 +128,43 @@
       toast(err.message || String(err), 'error');
       throw err;
     }
+  }
+
+  /* 页面内的确认弹窗。
+   *
+   * 不能用 window.confirm：面板给 iframe 的 sandbox 是
+   * "allow-scripts allow-forms allow-downloads"，没有 allow-modals，
+   * 浏览器会忽略原生弹窗并让 confirm() 直接返回 false —— 于是所有需要
+   * 确认的操作都会被静默取消，按钮看着像点了没反应。
+   */
+  let confirmResolve = null;
+  function confirmDialog(title, detail, { danger = true, okText = '确定' } = {}) {
+    $('#confirmTitle').textContent = title;
+    const detailBox = $('#confirmDetail');
+    detailBox.textContent = detail || '';
+    detailBox.hidden = !detail;
+    const okBtn = $('#confirmOk');
+    okBtn.textContent = okText;
+    okBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
+    $('#confirmModal').hidden = false;
+    okBtn.focus();
+    return new Promise((resolve) => { confirmResolve = resolve; });
+  }
+
+  function closeConfirm(answer) {
+    $('#confirmModal').hidden = true;
+    if (confirmResolve) {
+      confirmResolve(answer);
+      confirmResolve = null;
+    }
+  }
+
+  /* 列表类面板的加载态。切换 tab、翻页时先垫一屏骨架，
+   * 否则慢请求期间旧内容一直挂着，看不出在加载。 */
+  function showLoading(selector, rows = 3) {
+    const box = $(selector);
+    box.innerHTML = '';
+    for (let i = 0; i < rows; i++) box.appendChild(el('div', 'skeleton'));
   }
 
   // ─────────────────────────────────────────── 题库
@@ -156,7 +239,16 @@
     if (state.searchAnswer) params.search_answer = '1';
     if (state.session) params.session = state.session;
 
-    const data = await guard(api.get('stories', params));
+    showLoading('#list', 4);
+    let data;
+    try {
+      data = await api.get('stories', params);
+    } catch (err) {
+      $('#list').innerHTML = '';
+      $('#list').appendChild(el('div', 'empty', `加载失败：${err.message}`));
+      toast(err.message, 'error');
+      return;
+    }
     state.total = data.total;
     renderList(data);
   }
@@ -223,7 +315,8 @@
 
       const del = el('button', 'btn btn-sm btn-danger', '删除');
       del.onclick = async () => {
-        if (!confirm(`删除这道题？\n\n${item.puzzle.slice(0, 60)}`)) return;
+        const ok = await confirmDialog('删除这道题？', item.puzzle, { okText: '删除' });
+        if (!ok) return;
         await guard(api.post('story/delete', { source: state.source, id: item.id }), '已删除');
         await loadOverview();
         await loadStories();
@@ -265,7 +358,16 @@
   // ─────────────────────────────────────────── 会话
 
   async function loadSessions() {
-    const data = await guard(api.get('overview', {}));
+    showLoading('#sessionList', 2);
+    let data;
+    try {
+      data = await api.get('overview', {});
+    } catch (err) {
+      $('#sessionList').innerHTML = '';
+      $('#sessionList').appendChild(el('div', 'empty', `加载失败：${err.message}`));
+      toast(err.message, 'error');
+      return;
+    }
     state.sessions = data.sessions || [];
     const list = $('#sessionList');
     list.innerHTML = '';
@@ -295,7 +397,12 @@
 
       const reset = el('button', 'btn btn-sm btn-danger', '重置该会话');
       reset.onclick = async () => {
-        if (!confirm(`重置「${s.label}」的出题记录？\n这些题在该会话中会重新可用。`)) return;
+        const ok = await confirmDialog(
+          `重置「${s.label}」的出题记录？`,
+          '这些题在该会话中会重新可用，其他会话不受影响。',
+          { okText: '重置' },
+        );
+        if (!ok) return;
         await guard(api.post('usage/reset', { session: s.session }), '已重置');
         loadSessions();
       };
@@ -308,7 +415,16 @@
   // ─────────────────────────────────────────── 对局
 
   async function loadGames() {
-    const data = await guard(api.get('games', {}));
+    showLoading('#gameList', 2);
+    let data;
+    try {
+      data = await api.get('games', {});
+    } catch (err) {
+      $('#gameList').innerHTML = '';
+      $('#gameList').appendChild(el('div', 'empty', `加载失败：${err.message}`));
+      toast(err.message, 'error');
+      return;
+    }
     const list = $('#gameList');
     list.innerHTML = '';
     if (!data.games.length) {
@@ -346,7 +462,12 @@
       const actions = el('div', 'card-actions');
       const end = el('button', 'btn btn-sm btn-danger', '强制结束');
       end.onclick = async () => {
-        if (!confirm(`强制结束「${g.label}」的对局？`)) return;
+        const ok = await confirmDialog(
+          `强制结束「${g.label}」的对局？`,
+          '对局会被直接清掉，群里不会收到任何提示，汤底也不会公布。',
+          { okText: '结束' },
+        );
+        if (!ok) return;
         await guard(api.post('games/end', { key: g.key }), '已结束');
         loadGames();
       };
@@ -363,7 +484,17 @@
     $('#editorTitle').textContent = item ? '编辑题目' : '新增题目';
     $('#editPuzzle').value = item ? item.puzzle : '';
     $('#editAnswer').value = '';
+
+    // 只读题库上的「新增」会落到自定义题库，先说清楚再让人动手写
+    const note = $('#editorNote');
+    const readonly = !item && currentSource().readonly;
+    note.textContent = readonly
+      ? `${currentSource().label}是只读的，新题会存进自定义题库。`
+      : '';
+    note.hidden = !readonly;
+
     $('#editor').hidden = false;
+    $('#editPuzzle').focus();
 
     if (item) {
       // 编辑时需要原汤底做初值，这里是明确的编辑意图，直接拉取
@@ -405,7 +536,8 @@
     box.innerHTML = '';
     box.appendChild(el('p', 'muted', `正在生成 ${count} 道题，LLM 出题较慢，请稍候…`));
     try {
-      const data = await api.post('story/generate', { count });
+      // 一道题要等 LLM 一轮完整输出，5 道叠起来能远超默认的两分钟
+      const data = await api.post('story/generate', { count }, 600000);
       box.innerHTML = '';
       (data.created || []).forEach((item) => {
         const row = el('div', 'gen-item');
@@ -607,19 +739,49 @@
   $('#cfgSave').onclick = saveConfig;
   $('#cfgReset').onclick = resetConfig;
   $('#resetAll').onclick = async () => {
-    if (!confirm('重置所有会话的出题记录？\n所有群和私聊的记录都会清空。')) return;
+    const ok = await confirmDialog(
+      '重置所有会话的出题记录？',
+      '所有群和私聊的记录都会清空，三个题库的题目都会重新变成可出。',
+      { okText: '全部重置' },
+    );
+    if (!ok) return;
     await guard(api.post('usage/reset', {}), '已全部重置');
     loadSessions();
   };
+  $('#confirmOk').onclick = () => closeConfirm(true);
+  $('#confirmCancel').onclick = () => closeConfirm(false);
+  // 关掉确认框必须走 closeConfirm，否则等它的 Promise 永远不落地
+  function dismissModal(modal) {
+    if (modal.id === 'confirmModal') closeConfirm(false);
+    else modal.hidden = true;
+  }
+
   document.querySelectorAll('[data-close]').forEach((btn) => {
-    btn.onclick = () => { btn.closest('.modal').hidden = true; };
+    btn.onclick = () => dismissModal(btn.closest('.modal'));
   });
   document.querySelectorAll('.modal').forEach((modal) => {
-    modal.onclick = (e) => { if (e.target === modal) modal.hidden = true; };
+    modal.onclick = (e) => { if (e.target === modal) dismissModal(modal); };
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const open = [...document.querySelectorAll('.modal')].filter((m) => !m.hidden);
+      // 确认框可能盖在编辑器上面，只关最上面那层
+      if (open.length) dismissModal(open[open.length - 1]);
+      return;
+    }
+    if (e.key === 'Enter') {
+      if (!$('#confirmModal').hidden) { closeConfirm(true); return; }
+      // 编辑器里是多行文本框，回车要留给换行，用 Ctrl/Cmd+Enter 保存
+      if (!$('#editor').hidden && (e.ctrlKey || e.metaKey)) { saveEditor(); }
+    }
   });
 
   // 启动
+  initTheme();
+  showLoading('#list', 4);
   loadOverview().then(loadStories).catch((err) => {
+    $('#list').innerHTML = '';
     $('#list').appendChild(el('div', 'empty', `加载失败：${err.message}`));
   });
 })();

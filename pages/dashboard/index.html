@@ -74,6 +74,7 @@
 <div id="editor" class="modal" hidden>
   <div class="modal-box">
     <h3 id="editorTitle">新增题目</h3>
+    <p id="editorNote" class="note" hidden></p>
     <label class="field">
       <span>汤面</span>
       <textarea id="editPuzzle" rows="4" placeholder="玩家看到的题面"></textarea>
@@ -84,7 +85,21 @@
     </label>
     <div class="modal-actions">
       <button class="btn btn-ghost" data-close>取消</button>
-      <button id="editSave" class="btn btn-primary">保存</button>
+      <button id="editSave" class="btn btn-primary">保存（Ctrl+Enter）</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─────────────── 确认弹窗 ───────────────
+     面板给 iframe 的 sandbox 没有 allow-modals，window.confirm 会被浏览器
+     忽略并直接返回 false，所以确认要自己画一个 -->
+<div id="confirmModal" class="modal" hidden>
+  <div class="modal-box modal-sm">
+    <h3 id="confirmTitle"></h3>
+    <p id="confirmDetail" class="muted" hidden></p>
+    <div class="modal-actions">
+      <button id="confirmCancel" class="btn btn-ghost">取消</button>
+      <button id="confirmOk" class="btn btn-danger">确定</button>
     </div>
   </div>
 </div>
