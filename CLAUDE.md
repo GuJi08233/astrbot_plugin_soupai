@@ -96,6 +96,17 @@ from the web: editing it would dirty the working tree and conflict when merging
 upstream. Hiding a puzzle writes to a blocklist under the plugin data dir
 instead.
 
+The settings tab is generated from `config.schema`, which the `/config` route
+sends to the page verbatim — `options`, `labels`, `condition`, `secret` and
+`_special: select_provider` are all honoured, so a new `_conf_schema.json`
+item shows up on the web without frontend changes. Saving goes through
+`config/save` → `config.save_config(replace)` → `plugin._load_config()`;
+`save_config` alone does NOT rebuild the plugin instance (the panel path
+reloads, this one doesn't), which is exactly why `_load_config` exists. The
+`jev_api_key` field is write-only from the web: GET masks it to `""`, an
+empty POST value means "unchanged" and is skipped, and clearing it requires
+the explicit `clear_jev_api_key` flag.
+
 ## Invariants Worth Keeping
 
 - **Clear game state before sending the closing message.** `event.send`

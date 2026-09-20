@@ -54,6 +54,8 @@ class SoupaiWebApi:
             ("/usage/reset", self.usage_reset, ["POST"], "重置使用记录"),
             ("/games", self.games, ["GET"], "进行中的对局"),
             ("/games/end", self.games_end, ["POST"], "强制结束某局"),
+            ("/config", self.config_get, ["GET"], "插件配置（含服务商下拉项）"),
+            ("/config/save", self.config_save, ["POST"], "保存插件配置"),
         ]
         for route, handler, methods, desc in routes:
             self.plugin.context.register_web_api(
@@ -395,3 +397,117 @@ class SoupaiWebApi:
         if ended:
             logger.info(f"网页端强制结束对局 {key} by {request.username}")
         return _ok({"ended": ended})
+
+    # ------------------------------------------------------------ 配置
+
+    # 数值配置项的合法区间，超出则拒绝保存（面板上的 schema 有同样的 hint）
+    _INT_RANGES = {
+        "game_timeout": (30, 86400),
+        "storage_max_size": (5, 500),
+        "auto_generate_start": (0, 23),
+        "auto_generate_end": (0, 23),
+        "verification_limit": (0, 100),
+    }
+
+    def _providers_payload(self) -> list[dict]:
+        """AstrBot 里已配置的对话模型，供网页端的提供商下拉框用。"""
+        providers = []
+        try:
+            for provider in self.plugin.context.get_all_providers():
+                meta = provider.meta()
+                providers.append(
+                    {
+                        "id": meta.id,
+                        "model": meta.model,
+                        "enable": getattr(provider, "enable", True) is not False,
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"获取 LLM 服务商列表失败: {e}")
+        return providers
+
+    async def config_get(self):
+        """下发当前配置值 + 配置 schema + 服务商列表。
+
+        schema 原样下发（options/labels/condition/secret 等元数据），前端
+        和面板的 ConfigItemRenderer 用同一套规则渲染，新增配置项不用改前端。
+        jev_api_key 是密文：永远下发空串，前端空输入框表示「不修改」。
+        """
+        config = self.plugin.config
+        values: dict[str, Any] = {}
+        for key in config.schema or {}:
+            value = config.get(key)
+            if key == "jev_api_key":
+                value = ""
+            values[key] = value
+        return _ok(
+            {
+                "schema": config.schema or {},
+                "values": values,
+                "providers": self._providers_payload(),
+                # 密文不回显，但前端需要知道有没有设过，好显示占位提示
+                "has_jev_api_key": bool(str(config.get("jev_api_key") or "").strip()),
+            }
+        )
+
+    async def config_save(self):
+        """网页端保存配置。
+
+        只合并合法的键；jev_api_key 传空串表示「未修改」而跳过（它本身
+        允许为空=禁用 Jev，所以用单独的 clear_jev_api_key 字段显式清空）。
+        保存后调 plugin._load_config() 让新值立即生效——config.save_config
+        只写文件不重建插件实例，而这里不走面板那套热重载。
+        """
+        data = await self._payload()
+        config = self.plugin.config
+        schema = config.schema or {}
+
+        # 控制字段，不是配置项
+        clear_jev_key = bool(data.pop("clear_jev_api_key", False))
+
+        updates: dict[str, Any] = {}
+        for key, value in data.items():
+            if key not in schema:
+                return error_response(f"未知的配置项: {key}")
+            meta = schema[key]
+            ftype = meta.get("type")
+
+            if ftype == "int":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    return error_response(f"{key} 需要是整数")
+                lo, hi = self._INT_RANGES.get(key, (-(2**31), 2**31))
+                if not lo <= value <= hi:
+                    return error_response(f"{key} 需要在 {lo} ~ {hi} 之间")
+            elif ftype == "float":
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return error_response(f"{key} 需要是数字")
+            elif ftype == "bool":
+                value = bool(value)
+            elif ftype == "string":
+                value = str(value)
+                if meta.get("options") and value not in meta["options"]:
+                    return error_response(f"{key} 的值不合法: {value}")
+            else:
+                return error_response(f"配置项 {key} 的类型不受支持: {ftype}")
+
+            if key == "jev_api_key" and value == "":
+                # 空串=前端没改过这个输入框，不能把它当成「清空」
+                continue
+            updates[key] = value
+
+        if clear_jev_key:
+            updates["jev_api_key"] = ""
+
+        if not updates:
+            return _ok({"saved": 0})
+
+        config.save_config(updates)
+        self.plugin._load_config()
+        logger.info(
+            f"网页端保存配置: {', '.join(sorted(updates))} by {request.username}"
+        )
+        return _ok({"saved": len(updates)})

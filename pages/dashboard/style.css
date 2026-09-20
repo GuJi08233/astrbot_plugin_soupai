@@ -170,6 +170,20 @@ body {
 }
 .gen-item { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
 
+/* ── 设置 ── */
+.config-form {
+  display: flex; flex-direction: column; gap: 14px; margin-bottom: 16px;
+}
+.cfg-item {
+  display: flex; flex-direction: column; gap: 5px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.cfg-desc { font-weight: 500; }
+.cfg-hint { color: var(--muted); font-size: 12px; }
+.cfg-bool { flex-direction: row; align-items: center; }
+.cfg-bool .input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+
 /* ── 提示条 ── */
 .toast {
   position: fixed; top: 16px; left: 50%; transform: translateX(-50%);

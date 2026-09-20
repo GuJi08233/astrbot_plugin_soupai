@@ -433,6 +433,134 @@
     }
   }
 
+  // ─────────────────────────────────────────── 设置
+
+  const cfg = {
+    schema: {},        // 后端下发的配置 schema（和面板渲染用的同一份）
+    values: {},        // 当前正在编辑的值
+    saved: {},         // 最近一次加载/保存成功的快照，用于「撤销修改」
+    providers: [],
+    hasKey: false,
+    dirty: false,
+  };
+
+  // provider 下拉显示「id（model）」
+  function providerLabel(p) {
+    return p.model ? `${p.id}（${p.model}）` : p.id;
+  }
+
+  async function loadConfig() {
+    const data = await guard(api.get('config', {}));
+    cfg.schema = data.schema || {};
+    cfg.providers = data.providers || [];
+    cfg.hasKey = !!data.has_jev_api_key;
+    cfg.values = { ...data.values };
+    cfg.saved = { ...data.values };
+    cfg.dirty = false;
+    renderConfigForm();
+  }
+
+  // 和面板 ConfigItemRenderer 的 condition 语义一致：条件里的键值全部
+  // 相等才显示。目前只有 judge_engine 一个条件键
+  function conditionMet(cond) {
+    if (!cond) return true;
+    return Object.entries(cond).every(([key, expected]) => cfg.values[key] === expected);
+  }
+
+  function setValue(key, value, rerender) {
+    if (cfg.values[key] === value) return;
+    cfg.values[key] = value;
+    cfg.dirty = true;
+    // judge_engine 的开关会增删 Jev 区块，必须整表重绘；普通输入不要
+    // 重绘，否则打字打到一半会丢焦点
+    if (rerender) renderConfigForm();
+  }
+
+  function renderConfigForm() {
+    const form = $('#configForm');
+    form.innerHTML = '';
+    Object.entries(cfg.schema).forEach(([key, meta]) => {
+      if (!conditionMet(meta.condition)) return;
+      form.appendChild(renderConfigItem(key, meta));
+    });
+  }
+
+  function renderConfigItem(key, meta) {
+    const wrap = el('label', 'cfg-item');
+    wrap.appendChild(el('span', 'cfg-desc', meta.description || key));
+
+    let input;
+    const isNumeric = meta.type === 'int' || meta.type === 'float';
+    if (meta._special === 'select_provider') {
+      input = el('select', 'input');
+      input.appendChild(new Option('（使用系统默认）', ''));
+      cfg.providers.forEach((p) => input.appendChild(new Option(providerLabel(p), p.id)));
+      input.value = cfg.values[key] || '';
+      input.onchange = (e) => setValue(key, e.target.value);
+    } else if (meta.options) {
+      input = el('select', 'input');
+      const labels = meta.labels || meta.options;
+      meta.options.forEach((opt, i) => input.appendChild(new Option(labels[i] || opt, opt)));
+      input.value = cfg.values[key] || '';
+      input.onchange = (e) => setValue(key, e.target.value, true);
+    } else if (meta.type === 'bool') {
+      input = el('input', 'input');
+      input.type = 'checkbox';
+      input.checked = !!cfg.values[key];
+      // label 包着 checkbox 时点文字也会切换它，只触发一次 change，直接用
+      input.onchange = (e) => setValue(key, e.target.checked);
+      wrap.classList.add('cfg-bool');
+    } else {
+      input = el('input', 'input');
+      input.type = meta.secret ? 'password' : isNumeric ? 'number' : 'text';
+      if (meta.type === 'int') input.step = '1';
+      if (meta.type === 'float') input.step = '0.05';
+      if (key === 'jev_api_key') {
+        input.placeholder = cfg.hasKey ? '已设置（留空表示不修改）' : '未设置';
+        input.autocomplete = 'new-password';
+      }
+      input.value = cfg.values[key] ?? '';
+      input.oninput = (e) => setValue(key, isNumeric
+        ? (e.target.value === '' ? '' : Number(e.target.value))
+        : e.target.value);
+      if (isNumeric) {
+        // 数字框被清空后离开输入状态就回退成上次保存的值，避免存进空值
+        input.onblur = () => {
+          if (input.value === '') {
+            input.value = cfg.saved[key] ?? '';
+            cfg.values[key] = cfg.saved[key] ?? '';
+          }
+        };
+      }
+    }
+    wrap.appendChild(input);
+
+    if (meta.hint) wrap.appendChild(el('span', 'cfg-hint', meta.hint));
+    return wrap;
+  }
+
+  async function saveConfig() {
+    const btn = $('#cfgSave');
+    btn.disabled = true;
+    btn.textContent = '保存中…';
+    try {
+      const payload = { ...cfg.values };
+      // 空串表示「没改过」，不提交；显式清空走下面的 clear 字段
+      if (payload.jev_api_key === '') delete payload.jev_api_key;
+      await guard(api.post('config/save', payload), '配置已保存，立即生效');
+      await loadConfig();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '保存配置';
+    }
+  }
+
+  function resetConfig() {
+    cfg.values = { ...cfg.saved };
+    cfg.dirty = false;
+    renderConfigForm();
+  }
+
   // ─────────────────────────────────────────── 交互绑定
 
   function switchTab(name) {
@@ -444,6 +572,7 @@
     });
     if (name === 'sessions') loadSessions();
     if (name === 'games') loadGames();
+    if (name === 'settings') loadConfig();
   }
 
   document.querySelectorAll('.tab').forEach((tab) => {
@@ -475,6 +604,8 @@
   $('#editSave').onclick = saveEditor;
   $('#btnGenerate').onclick = () => { $('#genResult').hidden = true; $('#genModal').hidden = false; };
   $('#genRun').onclick = runGenerate;
+  $('#cfgSave').onclick = saveConfig;
+  $('#cfgReset').onclick = resetConfig;
   $('#resetAll').onclick = async () => {
     if (!confirm('重置所有会话的出题记录？\n所有群和私聊的记录都会清空。')) return;
     await guard(api.post('usage/reset', {}), '已全部重置');

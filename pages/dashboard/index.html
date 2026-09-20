@@ -14,6 +14,7 @@
     <button class="tab is-active" data-tab="stories">题库</button>
     <button class="tab" data-tab="sessions">会话</button>
     <button class="tab" data-tab="games">对局</button>
+    <button class="tab" data-tab="settings">设置</button>
   </div>
   <button id="refresh" class="btn btn-ghost" title="刷新">刷新</button>
 </header>
@@ -56,6 +57,17 @@
 <section class="panel" data-panel="games" hidden>
   <p class="hint">进行中的对局。汤底不会显示在这里。</p>
   <div id="gameList" class="list"></div>
+</section>
+
+<!-- ─────────────── 设置 ─────────────── -->
+<section class="panel" data-panel="settings" hidden>
+  <p class="hint">和面板里插件配置是同一份。保存后立即生效，不需要重载插件。</p>
+  <div id="configForm" class="config-form"></div>
+  <div class="toolbar">
+    <button id="cfgReset" class="btn btn-ghost">撤销修改</button>
+    <span class="grow"></span>
+    <button id="cfgSave" class="btn btn-primary">保存配置</button>
+  </div>
 </section>
 
 <!-- ─────────────── 编辑弹窗 ─────────────── -->

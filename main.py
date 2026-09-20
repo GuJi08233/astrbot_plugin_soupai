@@ -524,7 +524,60 @@ class SoupaiPlugin(Star):
         self.config = config
         self.game_state = GameState()
 
-        # 获取配置值
+        # Jev 的 httpx 客户端，首次判定时惰性创建
+        self._jev_client: httpx.AsyncClient | None = None
+
+        self._load_config()
+
+        # 难度设置
+        self.difficulty_settings = {
+            "简单": {
+                "limit": None,
+                "accept_levels": ["完全还原", "核心推理正确"],
+                "hint_limit": 10,
+            },
+            "普通": {
+                "limit": 35,
+                "accept_levels": ["完全还原"],
+                "hint_limit": 5,
+            },
+            "困难": {
+                "limit": 15,
+                "accept_levels": ["完全还原"],
+                "hint_limit": 1,
+            },
+            "666开挂了": {
+                "limit": 5,
+                "accept_levels": ["完全还原"],
+                "hint_limit": 0,
+            },
+        }
+        self.group_difficulty: dict[str, str] = {}
+
+        # 数据存储路径: 使用框架提供的工具获取插件数据目录
+        self.data_path = StarTools.get_data_dir()
+        self.data_path.mkdir(parents=True, exist_ok=True)
+
+        # 存储库初始化延迟到 init 方法中
+        self.local_story_storage = None
+        self.online_story_storage = None
+        self.custom_story_storage = None
+
+        # 防止重复调用的状态
+        self.generating_games = set()  # 正在生成谜题的群聊ID集合
+
+        # 自动生成状态
+        self.auto_generating = False
+        self.auto_generate_task = None
+
+    def _load_config(self) -> None:
+        """从 self.config 读取全部配置项到实例属性。
+
+        配置有两个入口：面板插件配置页，以及插件网页管理页的设置标签。
+        面板保存会热重载插件、实例整个重建，走这里没问题；网页端保存
+        用 config.save_config(replace) 只写文件不重建实例，所以保存后
+        也要调一次这里，让新配置立即生效，不用手动重载。
+        """
         self.generate_llm_provider_id = self.config.get("generate_llm_provider", "")
         self.judge_llm_provider_id = self.config.get("judge_llm_provider", "")
         self.game_timeout = self.config.get("game_timeout", 300)
@@ -572,52 +625,14 @@ class SoupaiPlugin(Star):
         self.jev_judge_min_confidence = float(
             self.config.get("jev_judge_min_confidence", 0.5)
         )
-        self._jev_client: httpx.AsyncClient | None = None
 
         if self.judge_engine == "jev" and not self.jev_api_key:
             logger.warning("判定引擎选了 Jev 但未填写 API Key，将继续使用 LLM 判定")
             self.judge_engine = "llm"
 
-        # 难度设置
-        self.difficulty_settings = {
-            "简单": {
-                "limit": None,
-                "accept_levels": ["完全还原", "核心推理正确"],
-                "hint_limit": 10,
-            },
-            "普通": {
-                "limit": 35,
-                "accept_levels": ["完全还原"],
-                "hint_limit": 5,
-            },
-            "困难": {
-                "limit": 15,
-                "accept_levels": ["完全还原"],
-                "hint_limit": 1,
-            },
-            "666开挂了": {
-                "limit": 5,
-                "accept_levels": ["完全还原"],
-                "hint_limit": 0,
-            },
-        }
-        self.group_difficulty: dict[str, str] = {}
-
-        # 数据存储路径: 使用框架提供的工具获取插件数据目录
-        self.data_path = StarTools.get_data_dir()
-        self.data_path.mkdir(parents=True, exist_ok=True)
-
-        # 存储库初始化延迟到 init 方法中
-        self.local_story_storage = None
-        self.online_story_storage = None
-        self.custom_story_storage = None
-
-        # 防止重复调用的状态
-        self.generating_games = set()  # 正在生成谜题的群聊ID集合
-
-        # 自动生成状态
-        self.auto_generating = False
-        self.auto_generate_task = None
+        # 客户端持有旧的 base_url 和 key，配置变了必须丢弃重建
+        if self._jev_client is not None:
+            self._jev_client = None
 
     def _ensure_story_storages(self) -> None:
         """确保题库存储被初始化。
