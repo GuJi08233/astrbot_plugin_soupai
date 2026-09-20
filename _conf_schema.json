@@ -46,5 +46,21 @@
       "custom_first",
       "random"
     ]
+  },
+  "reply_mode": {
+    "description": "回复方式",
+    "type": "string",
+    "hint": "quote=引用提问者的原消息后再回答，多人同时提问时能分清在回答谁；direct=直接回复，不引用。部分平台不支持引用时会自动降级为直接回复。",
+    "default": "quote",
+    "options": [
+      "quote",
+      "direct"
+    ]
+  },
+  "verification_limit": {
+    "description": "每局验证次数上限",
+    "type": "int",
+    "hint": "每局游戏最多可使用多少次 /验证。该限制全程生效，不再只在提问次数用完后才计数。填 0 表示不限次数。",
+    "default": 2
   }
-} 
+}

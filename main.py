@@ -6,15 +6,17 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.provider import LLMResponse
 from astrbot.api import logger, AstrBotConfig
+
+# SessionFilter 尚未在 astrbot.api.util 中导出，只能从 core 导入
 from astrbot.core.utils.session_waiter import (
     session_waiter,
     SessionController,
     SessionFilter,
 )
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Reply
 
 
 # 线程安全的题库管理基类
@@ -432,13 +434,6 @@ class GroupSessionFilter(SessionFilter):
         return self.group_id if current_group_id == self.group_id else ""
 
 
-@register(
-    "astrbot_plugin_soupai",
-    "KONpiGG",
-    "AI 海龟汤推理游戏插件，支持自动生成谜题、智能判断、验证系统、智能提示、存储库管理等功能。网络题库包含近300道海龟汤，还在持续更新中。",
-    "1.0.3",
-    "https://github.com/KONpiGG/astrbot_plugin_soupai",
-)
 class SoupaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -459,6 +454,14 @@ class SoupaiPlugin(Star):
         if self.puzzle_source_strategy == "ai_first":
             self.puzzle_source_strategy = "local_first"
 
+        # 回复方式：quote=引用提问者原消息，direct=直接回复
+        self.reply_mode = self.config.get("reply_mode", "quote")
+        if self.reply_mode not in ("quote", "direct"):
+            logger.warning(f"未知的 reply_mode 配置值 {self.reply_mode!r}，回退为 quote")
+            self.reply_mode = "quote"
+
+        # 每局可用的验证次数
+        self.verification_limit = self.config.get("verification_limit", 2)
 
         # 难度设置
         self.difficulty_settings = {
@@ -619,22 +622,32 @@ class SoupaiPlugin(Star):
                 await asyncio.sleep(300)  # 出错后等待5分钟再试
 
     # ✅ 生成谜题和答案
-    async def generate_story_with_llm(self) -> Tuple[str, str]:
+    def _resolve_provider(self, provider_id: str, umo: Optional[str] = None):
+        """解析要使用的 LLM 提供商，未找到时返回 None 并记录日志。
+
+        Args:
+            provider_id: 插件配置中指定的提供商 ID，留空表示跟随 AstrBot 当前设置。
+            umo: 会话标识。启用了「提供商会话隔离」时，据此取该会话偏好的模型。
+        """
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if provider is None:
+                logger.error(f"未找到指定的 LLM 提供商: {provider_id}")
+            return provider
+
+        provider = self.context.get_using_provider(umo=umo)
+        if provider is None:
+            logger.error("未配置 LLM 服务商")
+        return provider
+
+    async def generate_story_with_llm(self, umo: Optional[str] = None) -> Tuple[str, str]:
         """使用 LLM 生成海龟汤谜题"""
 
-        # 根据配置获取指定的生成 LLM 提供商
-        if self.generate_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.generate_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的生成 LLM 提供商: {self.generate_llm_provider_id}"
-                )
+        provider = self._resolve_provider(self.generate_llm_provider_id, umo)
+        if provider is None:
+            if self.generate_llm_provider_id:
                 return "（无法生成题面，指定的生成 LLM 提供商不存在）", "（无）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                logger.error("未配置 LLM 服务商")
-                return "（无法生成题面，请先配置大语言模型）", "（无）"
+            return "（无法生成题面，请先配置大语言模型）", "（无）"
 
         prompt = self._build_puzzle_prompt()
 
@@ -826,7 +839,7 @@ class SoupaiPlugin(Star):
 
     # ✅ 验证用户推理
     async def verify_user_guess(
-            self, user_guess: str, true_answer: str
+            self, user_guess: str, true_answer: str, umo: Optional[str] = None
     ) -> VerificationResult:
         """
         验证用户推理
@@ -834,22 +847,16 @@ class SoupaiPlugin(Star):
         Args:
             user_guess: 用户的推理内容
             true_answer: 标准答案
+            umo: 会话标识，用于按会话选择 LLM 提供商
 
         Returns:
             VerificationResult: 验证结果
         """
-        # 获取判断 LLM 提供商
-        if self.judge_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
-                )
+        provider = self._resolve_provider(self.judge_llm_provider_id, umo)
+        if provider is None:
+            if self.judge_llm_provider_id:
                 return VerificationResult("验证失败", "未配置判断 LLM，无法验证")
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return VerificationResult("验证失败", "未配置 LLM，无法验证")
+            return VerificationResult("验证失败", "未配置 LLM，无法验证")
 
         # 构建验证提示词
         system_prompt = self._build_verification_system_prompt()
@@ -896,9 +903,19 @@ class SoupaiPlugin(Star):
 
 注意：
 - 当等级为"完全还原"或"核心推理正确"时，表示玩家基本猜中了故事真相。
-- 评价应中立简洁，仅反映玩家推理的整体完成度、偏离程度或结构性问题。  
-- 严禁直接或间接泄露正确答案中的信息，包括行为动机、情节真相、因果反转等。  
+- 评价限一句话，只描述"完成度"本身，不得出现标准答案里的任何具体名词、人物关系、动机或情节。
+- 严禁直接或间接泄露正确答案中的信息，包括行为动机、情节真相、因果反转等。
 - 不得使用带有暗示性的语句，如"其实…"、"你忽略了…"、"正确是…"等。
+- 严禁指出玩家"哪一处"错了或"漏了什么"，那等同于告诉玩家答案。
+
+错误示范（这类评价一律禁止输出）：
+  评价：玩家识别了超重与尸体的核心因果链，但"实际没有超重"和凶手存在等细节有偏差。
+  ——它复述了答案里的具体情节，玩家看完就知道谜底了。
+
+正确示范：
+  评价：主干因果已接近，细节仍有偏差。
+  评价：抓到了部分线索，整体逻辑尚未成立。
+
 - 只输出等级和评价，不要添加其他内容。"""
 
     def _build_verification_user_prompt(self, user_guess: str, true_answer: str) -> str:
@@ -947,21 +964,16 @@ class SoupaiPlugin(Star):
             return VerificationResult("验证失败", f"解析验证结果时发生错误: {e}")
 
     # ✅ 判断提问的回答方式
-    async def judge_question(self, question: str, true_answer: str) -> str:
+    async def judge_question(
+            self, question: str, true_answer: str, umo: Optional[str] = None
+    ) -> str:
         """使用 LLM 判断用户提问的回答方式"""
 
-        # 根据配置获取指定的判断 LLM 提供商
-        if self.judge_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
-                )
+        provider = self._resolve_provider(self.judge_llm_provider_id, umo)
+        if provider is None:
+            if self.judge_llm_provider_id:
                 return "（未配置判断 LLM，无法判断）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return "（未配置 LLM，无法判断）"
+            return "（未配置 LLM，无法判断）"
 
         prompt = (
             f"海龟汤游戏规则：\n"
@@ -1041,19 +1053,14 @@ class SoupaiPlugin(Star):
             qa_history: List[Dict[str, str]],
             hint_history: List[str],
             allow_list: List[str],
+            umo: Optional[str] = None,
     ) -> str:
         """根据本局已记录的问答与提示生成新的方向性提示"""
-        if self.judge_llm_provider_id:
-            provider = self.context.get_provider_by_id(self.judge_llm_provider_id)
-            if provider is None:
-                logger.error(
-                    f"未找到指定的判断 LLM 提供商: {self.judge_llm_provider_id}"
-                )
+        provider = self._resolve_provider(self.judge_llm_provider_id, umo)
+        if provider is None:
+            if self.judge_llm_provider_id:
                 return "（未配置判断 LLM，无法提供提示）"
-        else:
-            provider = self.context.get_using_provider()
-            if provider is None:
-                return "（未配置 LLM，无法提供提示）"
+            return "（未配置 LLM，无法提供提示）"
 
         history_text = "\n".join(
             [f"问：{item['question']}\n答：{item['answer']}" for item in qa_history]
@@ -1309,7 +1316,7 @@ class SoupaiPlugin(Star):
         # 检查是否有活跃游戏，如果有活跃游戏，说明在会话控制中，不在这里处理
         if self.game_state.is_game_active(group_id):
             # 阻止事件继续传播，避免被会话控制系统重复处理
-            await event.block()
+            event.stop_event()
             return
         game = self.game_state.get_game(group_id)
         if not game:
@@ -1422,12 +1429,11 @@ class SoupaiPlugin(Star):
                         if game:
                             answer = game["answer"]
                             puzzle = game["puzzle"]
-                            await event.send(
-                                event.plain_result(
-                                    f"🎯 海龟汤游戏结束！\n\n📖 题面：{puzzle}\n📖 完整故事：{answer}\n\n感谢参与游戏！"
-                                )
-                            )
                             self.game_state.end_game(group_id)
+                            await self._safe_send(
+                                event,
+                                f"🎯 海龟汤游戏结束！\n\n📖 题面：{puzzle}\n📖 完整故事：{answer}\n\n感谢参与游戏！",
+                            )
                         controller.stop()
                         return
                     # Step 1: 检查是否是 /开头的命令，如果是则忽略，让指令处理器处理
@@ -1442,11 +1448,10 @@ class SoupaiPlugin(Star):
                     question_limit = game.get("question_limit") if game else None
                     question_count = game.get("question_count", 0) if game else 0
                     if question_limit is not None and question_count >= question_limit:
-                        remaining = 2 - game.get("verification_attempts", 0)
-                        await event.send(
-                            event.plain_result(
-                                f"❗️提问次数已用完，请使用 /验证 进行猜测（剩余{remaining}次验证机会）"
-                            )
+                        await self._send_reply(
+                            event,
+                            "❗️提问次数已用完，请使用 /验证 进行猜测。"
+                            f"{self._verification_quota_text(game)}",
                         )
                         return
 
@@ -1457,7 +1462,9 @@ class SoupaiPlugin(Star):
 
                     # 使用 LLM 判断回答（是否问答）
                     logger.info(f"使用 LLM 判断游戏问答: '{command_part}'")
-                    reply = await self.judge_question(command_part, current_answer)
+                    reply = await self.judge_question(
+                        command_part, current_answer, event.unified_msg_origin
+                    )
 
                     # 记录提问和回答
                     if game is not None:
@@ -1471,27 +1478,28 @@ class SoupaiPlugin(Star):
                         combined_reply = (
                             f"{reply}（{game['question_count']}/{question_limit}）"
                         )
-                        await event.send(event.plain_result(combined_reply))
+                        await self._send_reply(event, combined_reply)
 
                         if game["question_count"] >= question_limit:
-                            await event.send(
-                                event.plain_result(
-                                    "❗️提问次数已用完，将进入验证环节。你有2次验证机会，请使用 /验证 <推理内容>。"
-                                )
+                            await self._safe_send(
+                                event,
+                                "❗️提问次数已用完，将进入验证环节。"
+                                f"{self._verification_quota_text(game)}"
+                                "请使用 /验证 <推理内容>。",
                             )
                     else:
                         # 如果没有问题限制，只发送判断结果
-                        await event.send(event.plain_result(reply))
+                        await self._send_reply(event, reply)
 
                     # 重置超时时间
                     controller.keep(timeout=self.game_timeout, reset_timeout=True)
 
                 except Exception as e:
                     logger.error(f"会话控制内部错误: {e}")
-                    await event.send(event.plain_result(f"游戏处理过程中发生错误：{e}"))
-                    # 如果发生错误，结束游戏
+                    # 先结束游戏再发消息，确保发送失败也不会残留状态
                     self.game_state.end_game(group_id)
                     controller.stop()
+                    await self._safe_send(event, f"游戏处理过程中发生错误：{e}")
 
             try:
                 # 使用群 ID 限制会话范围，避免多个群并发时互相触发
@@ -1499,19 +1507,97 @@ class SoupaiPlugin(Star):
             except TimeoutError:
                 game = self.game_state.get_game(group_id)
                 if game:
-                    await event.send(
-                        event.plain_result(
-                            f"⏰ 游戏超时！\n\n📖 完整故事：{game['answer']}\n\n游戏结束！"
-                        )
-                    )
+                    true_answer = game["answer"]
+                    # 先清状态再发消息：平台掉线时 send 会抛异常，
+                    # 若先发后清，本局将永久卡在「进行中」而无法重开
                     self.game_state.end_game(group_id)
+                    await self._safe_send(
+                        event,
+                        f"⏰ 游戏超时！\n\n📖 完整故事：{true_answer}\n\n游戏结束！",
+                    )
             except Exception as e:
                 logger.error(f"游戏会话错误: {e}")
-                await event.send(event.plain_result(f"游戏过程中发生错误：{e}"))
                 self.game_state.end_game(group_id)
+                await self._safe_send(event, f"游戏过程中发生错误：{e}")
+            finally:
+                # 会话监听器已退出，此后没有任何消息会被处理。
+                # 无论因何种原因退出，都必须清掉残留状态，否则 /汤 无法重开
+                if self.game_state.is_game_active(group_id):
+                    logger.warning(f"会话已结束但游戏状态残留，强制清理: {group_id}")
+                    self.game_state.end_game(group_id)
         except Exception as e:
             logger.error(f"启动游戏会话失败: {e}")
-            await event.send(event.plain_result(f"启动游戏会话失败：{e}"))
+            self.game_state.end_game(group_id)
+            await self._safe_send(event, f"启动游戏会话失败：{e}")
+
+    def _reply_result(self, event: AstrMessageEvent, text: str) -> MessageEventResult:
+        """构造回复结果，按 reply_mode 决定是否引用提问者的原消息。
+
+        群里多人同时提问时，裸的「是/不是」分不清在回答谁，引用原消息可消除歧义。
+        取不到消息 ID 的平台自动降级为纯文本。
+        """
+        result = event.plain_result(text)
+        if self.reply_mode != "quote":
+            return result
+        try:
+            message_id = getattr(event.message_obj, "message_id", None)
+            if message_id:
+                result.chain.insert(0, Reply(id=message_id))
+        except Exception as e:
+            logger.debug(f"构造引用回复失败，降级为纯文本: {e}")
+        return result
+
+    async def _send_reply(self, event: AstrMessageEvent, text: str) -> None:
+        """在会话中发送一条引用提问者的回复。"""
+        await event.send(self._reply_result(event, text))
+
+    def _format_game_status(self, game: Dict) -> str:
+        """构建游戏状态文本，供 /汤状态 指令与会话内查询共用。"""
+        question_count = game.get("question_count", 0)
+        question_limit = game.get("question_limit")
+        hint_count = game.get("hint_count", 0)
+        hint_limit = game.get("hint_limit")
+
+        # 不限次数时不显示 ∞，直接说明（issue #27）
+        question_info = (
+            f"{question_count}/{question_limit}"
+            if question_limit
+            else f"{question_count}（不限次数）"
+        )
+        hint_info = f"{hint_count}/{hint_limit}" if hint_limit else "不可用"
+
+        lines = [
+            "🎮 当前有活跃的海龟汤游戏",
+            f"📖 题面：{game['puzzle']}",
+            f"🎯 难度：{game.get('difficulty', '普通')}",
+            f"❓ 提问：{question_info}",
+            f"💡 提示：{hint_info}",
+        ]
+        if self.verification_limit > 0:
+            used = game.get("verification_attempts", 0)
+            lines.append(f"🔍 验证：{used}/{self.verification_limit}")
+        return "\n".join(lines)
+
+    def _verification_quota_text(self, game: Optional[Dict]) -> str:
+        """描述本局还剩多少次验证机会。"""
+        if self.verification_limit <= 0:
+            return "验证次数不限。"
+        used = game.get("verification_attempts", 0) if game else 0
+        remaining = max(self.verification_limit - used, 0)
+        return f"你还有 {remaining} 次验证机会。"
+
+    async def _safe_send(self, event: AstrMessageEvent, text: str) -> bool:
+        """发送消息并吞掉发送异常，返回是否成功。
+
+        用于结束游戏一类的收尾消息：平台掉线时发送会抛异常，
+        绝不能让它阻断后续的状态清理（否则本局会永久卡在「进行中」）。
+        """
+        try:
+            await event.send(event.plain_result(text))
+            return True
+        except Exception as e:
+            logger.error(f"发送消息失败（已忽略，不影响游戏状态清理）: {e}")
+            return False
 
     def _is_at_bot(self, event: AstrMessageEvent) -> bool:
         """检查消息是否@了bot"""
@@ -1829,20 +1915,7 @@ class SoupaiPlugin(Star):
 
             if self.game_state.is_game_active(group_id):
                 game = self.game_state.get_game(group_id)
-                difficulty = game.get("difficulty", "普通")
-                question_count = game.get("question_count", 0)
-                question_limit = game.get("question_limit")
-                hint_count = game.get("hint_count", 0)
-                hint_limit = game.get("hint_limit")
-
-                question_info = f"{question_count}/{question_limit}" if question_limit else f"{question_count}/∞"
-                hint_info = f"{hint_count}/{hint_limit}" if hint_limit else "不可用"
-
-                await event.send(
-                    event.plain_result(
-                        f"🎮 当前有活跃的海龟汤游戏\n📖 题面：{game['puzzle']}\n🎯 难度：{difficulty}\n❓ 提问：{question_info}\n💡 提示：{hint_info}"
-                    )
-                )
+                await event.send(event.plain_result(self._format_game_status(game)))
             else:
                 await event.send(
                     event.plain_result(
@@ -1924,7 +1997,12 @@ class SoupaiPlugin(Star):
         allow_list = self.build_allow_list(game["puzzle"], qa_history)
 
         hint = await self.generate_hint(
-            game["puzzle"], game["answer"], qa_history, hint_history, allow_list
+            game["puzzle"],
+            game["answer"],
+            qa_history,
+            hint_history,
+            allow_list,
+            event.unified_msg_origin,
         )
         game["hint_count"] = hint_count + 1
         game["hint_history"] = hint_history + [hint]
@@ -1933,17 +2011,40 @@ class SoupaiPlugin(Star):
             suffix = f"（{game['hint_count']}/{hint_limit}）"
         return event.plain_result(f"提示：{hint}{suffix}")
 
+    # 未猜中时给出的固定引导语。不使用 LLM 生成的评价，
+    # 因为它为了说明"哪里偏了"必然要引用答案细节，等于剧透（issue #28）
+    _LEVEL_FEEDBACK = {
+        "完全还原": "推理方向正确。",
+        "核心推理正确": "已经摸到主干了，再补一补细节。",
+        "部分正确": "抓到了一些线索，但整体因果链还没串起来。",
+        "基本不符": "方向偏了，换个角度重新想想。",
+        "验证失败": "这次没能判定，请换种表述再试一次。",
+    }
+
     async def _handle_verification_in_session(
             self, event: AstrMessageEvent, user_guess: str, answer: str
     ):
         """在会话控制中处理验证逻辑"""
         try:
-
-            # 验证用户推理
-            result = await self.verify_user_guess(user_guess, answer)
-
             group_id = event.get_group_id()
             game = self.game_state.get_game(group_id) if group_id else None
+
+            # 先检查次数：验证机会全程有限，不论提问次数是否用完（issue #22）
+            if game is not None and self.verification_limit > 0:
+                used = game.get("verification_attempts", 0)
+                if used >= self.verification_limit:
+                    await self._send_reply(
+                        event,
+                        f"❗️验证次数已用完（{used}/{self.verification_limit}），"
+                        f"请继续提问或使用 /揭晓 查看答案。",
+                    )
+                    return
+
+            # 验证用户推理
+            result = await self.verify_user_guess(
+                user_guess, answer, event.unified_msg_origin
+            )
+
             accept_levels = (
                 game.get("accept_levels", ["完全还原", "核心推理正确"])
                 if game
@@ -1951,44 +2052,65 @@ class SoupaiPlugin(Star):
             )
             is_correct = result.level in accept_levels
 
-            # 返回验证结果
-            response = f"等级：{result.level}\n评价：{result.comment}"
-            await event.send(event.plain_result(response))
-
             if is_correct:
-                await event.send(
-                    event.plain_result(
-                        f"🎉 恭喜！你猜中了！\n\n📖 完整故事：{answer}\n\n游戏结束！"
-                    )
-                )
+                # 猜中，游戏结束，此时公布评价和完整故事已无剧透风险
                 if group_id:
                     self.game_state.end_game(group_id)
+                await self._safe_send(
+                    event,
+                    f"等级：{result.level}\n评价：{result.comment}\n\n"
+                    f"🎉 恭喜！你猜中了！\n\n📖 完整故事：{answer}\n\n游戏结束！",
+                )
                 return
 
-            if (
-                    game
-                    and game.get("question_limit") is not None
-                    and game.get("question_count", 0) >= game.get("question_limit")
-            ):
-                game["verification_attempts"] = game.get("verification_attempts", 0) + 1
-                remaining = 2 - game["verification_attempts"]
-                if remaining > 0:
-                    await event.send(
-                        event.plain_result(
-                            f"❌ 验证未通过，你还有 {remaining} 次机会。"
-                        )
-                    )
-                else:
-                    await event.send(
-                        event.plain_result(
-                            f"❌ 验证未通过。\n\n📖 完整故事：{answer}\n\n游戏结束！"
-                        )
-                    )
-                    self.game_state.end_game(group_id)
+            # 未猜中：只回等级和固定引导语，不回 LLM 评价
+            if game is None:
+                await self._send_reply(
+                    event,
+                    f"等级：{result.level}\n"
+                    f"{self._LEVEL_FEEDBACK.get(result.level, '继续加油。')}",
+                )
+                return
+
+            game["verification_attempts"] = game.get("verification_attempts", 0) + 1
+            feedback = self._LEVEL_FEEDBACK.get(result.level, "继续加油。")
+
+            if self.verification_limit <= 0:
+                await self._send_reply(event, f"等级：{result.level}\n{feedback}")
+                return
+
+            remaining = self.verification_limit - game["verification_attempts"]
+            question_limit = game.get("question_limit")
+            questions_exhausted = (
+                question_limit is not None
+                and game.get("question_count", 0) >= question_limit
+            )
+
+            if remaining > 0:
+                await self._send_reply(
+                    event,
+                    f"等级：{result.level}\n{feedback}\n"
+                    f"❌ 验证未通过，你还有 {remaining} 次机会。",
+                )
+            elif questions_exhausted:
+                # 提问和验证都用尽，本局无路可走，揭晓答案收场
+                self.game_state.end_game(group_id)
+                await self._safe_send(
+                    event,
+                    f"等级：{result.level}\n❌ 验证机会已用尽。\n\n"
+                    f"📖 完整故事：{answer}\n\n游戏结束！",
+                )
+            else:
+                # 验证用尽但提问还有余量，游戏继续，不能直接揭晓答案
+                await self._send_reply(
+                    event,
+                    f"等级：{result.level}\n{feedback}\n"
+                    "❌ 验证次数已用完，请继续提问或使用 /揭晓 查看答案。",
+                )
 
         except Exception as e:
             logger.error(f"会话验证失败: {e}")
-            await event.send(event.plain_result(f"验证过程中发生错误：{e}"))
+            await self._safe_send(event, f"验证过程中发生错误：{e}")
 
     # 📊 游戏状态查询
     @filter.command("汤状态")
@@ -2002,18 +2124,7 @@ class SoupaiPlugin(Star):
 
         if self.game_state.is_game_active(group_id):
             game = self.game_state.get_game(group_id)
-            difficulty = game.get("difficulty", "普通")
-            question_count = game.get("question_count", 0)
-            question_limit = game.get("question_limit")
-            hint_count = game.get("hint_count", 0)
-            hint_limit = game.get("hint_limit")
-
-            question_info = f"{question_count}/{question_limit}" if question_limit else f"{question_count}/∞"
-            hint_info = f"{hint_count}/{hint_limit}" if hint_limit else "不可用"
-
-            yield event.plain_result(
-                f"🎮 当前有活跃的海龟汤游戏\n📖 题面：{game['puzzle']}\n🎯 难度：{difficulty}\n❓ 提问：{question_info}\n💡 提示：{hint_info}"
-            )
+            yield event.plain_result(self._format_game_status(game))
         else:
             yield event.plain_result(
                 "🎮 当前没有活跃的海龟汤游戏\n💡 使用 /汤 开始新游戏"
@@ -2244,7 +2355,7 @@ class SoupaiPlugin(Star):
         # 检查是否有活跃游戏，如果有活跃游戏，说明在会话控制中，不在这里处理
         if self.game_state.is_game_active(group_id):
             # 阻止事件继续传播，避免被会话控制系统重复处理
-            await event.block()
+            event.stop_event()
             return
         # 只有在没有活跃游戏时才在这里处理（用于游戏外的验证）
         yield event.plain_result("当前没有活跃的海龟汤游戏，请使用 /汤 开始新游戏")
