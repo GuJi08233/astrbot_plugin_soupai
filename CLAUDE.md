@@ -17,7 +17,8 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 
 ## Key Components
 
-- **Network puzzle database**: `network_soupai.json` with ~300 pre-scraped puzzles
+- **Network puzzle database**: `network_soupai.json`, 188 puzzles, each with a
+  stable `id` (sha1 of the puzzle text, first 12 hex chars)
 - **Configuration**: `_conf_schema.json` defines plugin settings
 - **Metadata**: `metadata.yaml` for plugin registration
 
@@ -91,6 +92,27 @@ That bridge implements only `api:get` and `api:post` — do not add PUT/DELETE
 routes, they cannot be reached. Handlers return `{"status": "ok", "data": ...}`;
 the bridge unwraps `data` before the page sees it.
 
+Three things about that iframe are easy to get wrong, and all three fail
+*silently* — the page renders fine and simply never works:
+
+- **Every outgoing message needs `kind: 'request'`.** The panel's
+  `handleWindowMessage` only dispatches `kind === 'ready'` and
+  `kind === 'request'`; anything else is dropped without a word, and the page
+  then sits there until its own timeout fires. This shipped broken once: every
+  single request timed out, which also made the puzzle bank look empty.
+- **`window.confirm` / `alert` / `prompt` do nothing.** The panel's sandbox is
+  `allow-scripts allow-forms allow-downloads`, with no `allow-modals`, so the
+  browser ignores the call and `confirm()` returns `false` — every guarded
+  action is cancelled and the button looks dead. Use `confirmDialog()`.
+- **Theme comes from the panel, not the OS.** It arrives twice: `?theme=` on
+  the iframe URL and `isDark` in the `kind: 'context'` message (re-sent on every
+  panel theme switch). `app.js` writes it to `<html data-theme>`, which is what
+  `style.css` keys off. A bare `prefers-color-scheme` rule goes white when the
+  panel is dark but the OS is light.
+
+Posting `kind: 'ready'` on startup makes the panel re-send that context, which
+is also how `locale`/`i18n` would arrive if the page ever needs them.
+
 `network_soupai.json` ships with the repo, so the network bank is read-only
 from the web: editing it would dirty the working tree and conflict when merging
 upstream. Hiding a puzzle writes to a blocklist under the plugin data dir
@@ -121,7 +143,12 @@ the explicit `clear_jev_api_key` flag.
   bogus 「是」 does not end the game.
 - **Usage records key on story id, never on list position.** Positions shift
   when the local bank evicts its oldest entry or the web UI deletes something,
-  which silently reassigns "already used" to a different puzzle.
+  which silently reassigns "already used" to a different puzzle. Every bank now
+  carries real ids, so `story_id`'s fall back to the index should never fire;
+  if you ever regenerate `network_soupai.json`, derive the ids from the puzzle
+  text the same way so existing records survive. Records written before the
+  network bank had ids are detected and dropped by
+  `NetworkSoupaiStorage._drop_index_era_records`.
 - **Usage is per session (`unified_msg_origin`), not global.** Each group and
   DM works through the bank independently. Games are still keyed by `group_id`,
   so each game carries a `session` field to tie the two together — keep writing
