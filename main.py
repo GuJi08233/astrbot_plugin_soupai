@@ -817,11 +817,11 @@ class SoupaiPlugin(Star):
         state: dict,
         instructions: str,
         criteria: dict[str, str],
-    ) -> str | None:
+    ) -> tuple[str, float] | None:
         """用 Jev 做一次单选判定。
 
-        返回选中的选项；未启用 Jev、置信度不足或请求失败时返回 None，
-        调用方据此改用 LLM。Jev 只会返回 criteria 里的键，不会跑题。
+        返回 (选中的选项, 置信度)；未启用 Jev、置信度不足或请求失败时返回
+        None，调用方据此改用 LLM。Jev 只会返回 criteria 里的键，不会跑题。
 
         关闭兜底时置信度门槛不生效（始终采信 Jev），但请求真的失败时
         仍然返回 None —— 否则玩家等不到任何回复。
@@ -871,7 +871,7 @@ class SoupaiPlugin(Star):
             return None
 
         logger.info(f"Jev 判定: {choice}（置信度 {confidence:.2f}）")
-        return choice
+        return choice, confidence
 
     def _resolve_provider(self, provider_id: str, umo: str | None = None):
         """解析要使用的 LLM 提供商，未找到时返回 None 并记录日志。
@@ -1236,8 +1236,14 @@ class SoupaiPlugin(Star):
         true_answer: str,
         umo: str | None = None,
         puzzle: str = "",
-    ) -> str:
-        """判断用户提问的回答方式，优先走 Jev，失败则用 LLM"""
+    ) -> tuple[str, dict]:
+        """判断用户提问的回答方式，优先走 Jev，失败则用 LLM。
+
+        返回 (判定文本, 判定来源)。来源形如 ``{"engine": "jev",
+        "confidence": 0.99}`` 或 ``{"engine": "llm", "fallback": True}``，
+        网页端的对局页靠它标出每一问到底是谁判的；判不出来时是
+        ``{"engine": "unavailable"}``，那条回复不是真正的判定结果。
+        """
 
         jev_choice = await self._jev_choice(
             state={"谜面": puzzle, "真相": true_answer, "玩家提问": question},
@@ -1245,16 +1251,21 @@ class SoupaiPlugin(Star):
             criteria=self._JUDGE_CRITERIA,
         )
         if jev_choice:
-            return jev_choice
+            choice, confidence = jev_choice
+            return choice, {"engine": "jev", "confidence": round(confidence, 2)}
         if self.judge_engine == "jev" and not self.judge_fallback_to_llm:
             # 选了 Jev 又关了兜底，走到这里说明请求真的失败了
-            return "判定服务暂时不可用，请稍后再问一次"
+            return "判定服务暂时不可用，请稍后再问一次", {"engine": "unavailable"}
+
+        # 配置的是 Jev 却走到这里，说明上面那次判定没成，这一问是回退来的
+        llm_source = {"engine": "llm", "fallback": self.judge_engine == "jev"}
 
         provider = self._resolve_provider(self.judge_llm_provider_id, umo)
         if provider is None:
+            unavailable = {"engine": "unavailable"}
             if self.judge_llm_provider_id:
-                return "（未配置判断 LLM，无法判断）"
-            return "（未配置 LLM，无法判断）"
+                return "（未配置判断 LLM，无法判断）", unavailable
+            return "（未配置 LLM，无法判断）", unavailable
 
         prompt = (
             f"海龟汤游戏规则：\n"
@@ -1294,17 +1305,18 @@ class SoupaiPlugin(Star):
             valid_responses = {"是", "否", "是也不是", "不重要"}
             reply = llm_resp.completion_text.strip()
             if reply in valid_responses:
-                return reply
-            return "你给ai干宕机了或者有什么其他原因，反正他没好好回复，我也不知道为什么（我努力修过代码了）"
+                return reply, llm_source
+            return (
+                "你给ai干宕机了或者有什么其他原因，反正他没好好回复，我也不知道为什么（我努力修过代码了）",
+                {"engine": "unavailable"},
+            )
 
         except Exception as e:
             logger.error(f"判断问题失败: {e}")
-            return "（判断失败，请重试）"
+            return "（判断失败，请重试）", {"engine": "unavailable"}
 
     # ✅ 生成方向性提示
-    def build_allow_list(
-        self, puzzle: str, qa_history: list[dict[str, str]]
-    ) -> list[str]:
+    def build_allow_list(self, puzzle: str, qa_history: list[dict]) -> list[str]:
         """根据题面和历史问答构建允许在提示中出现的名词列表"""
         import re
 
@@ -1333,7 +1345,7 @@ class SoupaiPlugin(Star):
         self,
         puzzle: str,
         true_answer: str,
-        qa_history: list[dict[str, str]],
+        qa_history: list[dict],
         hint_history: list[str],
         allow_list: list[str],
         umo: str | None = None,
@@ -1749,17 +1761,24 @@ class SoupaiPlugin(Star):
 
                     # 使用 LLM 判断回答（是否问答）
                     logger.info(f"使用 LLM 判断游戏问答: '{command_part}'")
-                    reply = await self.judge_question(
+                    reply, judged_by = await self.judge_question(
                         command_part,
                         current_answer,
                         event.unified_msg_origin,
                         game.get("puzzle", "") if game else "",
                     )
 
-                    # 记录提问和回答
+                    # 记录提问和回答。judged_by 只给网页端的对局页看，
+                    # 群里不显示——玩家没必要知道这一问是谁判的
                     if game is not None:
                         history = game.setdefault("qa_history", [])
-                        history.append({"question": command_part, "answer": reply})
+                        history.append(
+                            {
+                                "question": command_part,
+                                "answer": reply,
+                                "judged_by": judged_by,
+                            }
+                        )
 
                     # 更新问题计数
                     if question_limit is not None and game is not None:

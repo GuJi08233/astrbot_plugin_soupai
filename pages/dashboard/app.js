@@ -414,6 +414,39 @@
 
   // ─────────────────────────────────────────── 对局
 
+  /* 每一问是谁判的。judged_by 由 judge_question 写入：Jev 直接给出判定、
+   * Jev 没成改用 LLM、或者本来就配置走 LLM。旧记录没有这个字段。 */
+  function judgedByTag(by) {
+    if (!by || !by.engine) return null;
+    if (by.engine === 'jev') {
+      const c = typeof by.confidence === 'number' ? ` ${by.confidence.toFixed(2)}` : '';
+      return el('span', 'tag tag-jev', `Jev${c}`);
+    }
+    if (by.engine === 'llm') {
+      return by.fallback
+        ? el('span', 'tag tag-fallback', 'LLM · Jev 回退')
+        : el('span', 'tag tag-llm', 'LLM');
+    }
+    return el('span', 'tag tag-muted', '判定失败');
+  }
+
+  function judgeSummary(history) {
+    const n = { jev: 0, fallback: 0, llm: 0, bad: 0 };
+    history.forEach((qa) => {
+      const by = qa.judged_by;
+      if (!by || !by.engine) return;
+      if (by.engine === 'jev') n.jev++;
+      else if (by.engine === 'llm') by.fallback ? n.fallback++ : n.llm++;
+      else n.bad++;
+    });
+    const parts = [];
+    if (n.jev) parts.push(`Jev ${n.jev}`);
+    if (n.fallback) parts.push(`回退 LLM ${n.fallback}`);
+    if (n.llm) parts.push(`LLM ${n.llm}`);
+    if (n.bad) parts.push(`判定失败 ${n.bad}`);
+    return parts.join(' · ');
+  }
+
   async function loadGames() {
     showLoading('#gameList', 2);
     let data;
@@ -443,7 +476,9 @@
       const h = g.hint_limit ? `${g.hint_count}/${g.hint_limit}` : '不可用';
       const v = data.verification_limit > 0
         ? `${g.verification_attempts}/${data.verification_limit}` : `${g.verification_attempts}（不限）`;
-      card.appendChild(el('p', 'muted', `提问 ${q} · 提示 ${h} · 验证 ${v}`));
+      const summary = judgeSummary(g.qa_history || []);
+      card.appendChild(el('p', 'muted',
+        `提问 ${q} · 提示 ${h} · 验证 ${v}${summary ? ` · 判定 ${summary}` : ''}`));
 
       if (g.qa_history && g.qa_history.length) {
         const details = el('details', 'qa');
@@ -453,6 +488,8 @@
           const li = el('li');
           li.appendChild(el('span', 'qa-q', qa.question));
           li.appendChild(el('span', 'qa-a', qa.answer));
+          const by = judgedByTag(qa.judged_by);
+          if (by) li.appendChild(by);
           ol.appendChild(li);
         });
         details.appendChild(ol);

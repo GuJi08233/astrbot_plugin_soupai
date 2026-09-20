@@ -1,7 +1,7 @@
 name: astrbot_plugin_soupai
 display_name: AI 海龟汤
 author: KONpiGG
-version: 1.2.0
+version: 1.3.0
 desc: AI 海龟汤推理游戏插件，支持自动生成谜题、智能判断、验证系统、智能提示、存储库管理等功能。内置 188 道去重后的网络题库，还在持续更新中。
 repo: https://github.com/GuJi08233/astrbot_plugin_soupai
 astrbot_version: ">=4.16,<5"

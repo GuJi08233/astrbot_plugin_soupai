@@ -141,6 +141,10 @@ body {
 .qa li { margin-bottom: 4px; }
 .qa-q { }
 .qa-a { color: var(--accent); margin-left: 8px; font-weight: 500; }
+/* 判定来源：Jev 自己判的、Jev 没成回退 LLM、或本来就走 LLM */
+.qa .tag { margin-left: 8px; vertical-align: 1px; }
+.tag-jev { background: var(--ok); color: var(--surface); border-color: transparent; }
+.tag-fallback { background: var(--used-bg); color: var(--used); border-color: transparent; }
 
 /* ── 分页 ── */
 .pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 16px; }
