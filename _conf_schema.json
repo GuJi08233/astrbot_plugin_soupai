@@ -78,17 +78,20 @@
     "hint": "存储库最多保存多少个备用故事",
     "default": 50
   },
-  "auto_generate_start": {
-    "description": "自动生成开始时间",
-    "type": "int",
-    "hint": "每天自动生成备用故事的开始时间（小时，24小时制）",
-    "default": 3
+  "auto_generate_enabled": {
+    "description": "自动补充题库",
+    "type": "bool",
+    "hint": "开启后，后台每 5 分钟检查一次本地存储库，剩余未出题数低于下面的阈值就自动生成新题补满；关闭后只能手动生成（/备用开始 或网页端）。",
+    "default": true
   },
-  "auto_generate_end": {
-    "description": "自动生成结束时间",
+  "auto_generate_min": {
+    "description": "自动补充的剩余题数阈值",
     "type": "int",
-    "hint": "每天自动生成备用故事的结束时间（小时，24小时制）",
-    "default": 6
+    "hint": "本地存储库的剩余未出题数低于此值时自动补充，直到存满；填 0 等于不自动补充。",
+    "default": 10,
+    "condition": {
+      "auto_generate_enabled": true
+    }
   },
   "puzzle_source_strategy": {
     "description": "谜题来源策略",

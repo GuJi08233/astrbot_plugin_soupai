@@ -624,6 +624,8 @@ class SoupaiPlugin(Star):
         # 自动生成状态
         self.auto_generating = False
         self.auto_generate_task = None
+        # 当前这轮生成是否由自动补充触发；关闭开关时只停自动轮，不动 /备用开始
+        self._auto_started = False
 
     def _load_config(self) -> None:
         """从 self.config 读取全部配置项到实例属性。
@@ -643,8 +645,11 @@ class SoupaiPlugin(Star):
         ).strip()
         self.game_timeout = self.config.get("game_timeout", 300)
         self.storage_max_size = self.config.get("storage_max_size", 50)
-        self.auto_generate_start = self.config.get("auto_generate_start", 3)
-        self.auto_generate_end = self.config.get("auto_generate_end", 6)
+        # 自动补充题库：开关 + 剩余题数阈值
+        self.auto_generate_enabled = bool(
+            self.config.get("auto_generate_enabled", True)
+        )
+        self.auto_generate_min = self.config.get("auto_generate_min", 10)
         self.puzzle_source_strategy = self.config.get(
             "puzzle_source_strategy", "network_first"
         )
@@ -769,43 +774,49 @@ class SoupaiPlugin(Star):
         logger.info("海龟汤插件已卸载呜呜呜呜呜")
 
     async def _start_auto_generate(self):
-        """启动自动生成任务"""
+        """后台巡检：本地存储库剩余题数低于阈值时自动补满。
+
+        每 5 分钟检查一次。开关关闭时只停掉自动启动的那轮生成，
+        手动 /备用开始 的生成不受影响。
+        """
         while True:
             try:
-                now = datetime.now()
-                current_hour = now.hour
-
-                # 检查是否在自动生成时间范围内
-                if self.auto_generate_start <= current_hour < self.auto_generate_end:
-                    if not self.auto_generating:
-                        # 检查存储库是否已满，如果已满则不启动自动生成
-                        self._ensure_story_storages()
-                        storage_info = self.local_story_storage.get_storage_info()
-                        if storage_info["available"] <= 0:
-                            logger.info(
-                                f"本地存储库已满，跳过自动生成，时间: {current_hour}:00"
-                            )
-                            # 等待1小时后再次检查
-                            await asyncio.sleep(3600)  # 1小时
-                            continue
-
-                        logger.info(f"开始自动生成故事，时间: {current_hour}:00")
-                        self.auto_generating = True
-                        self._generation_loop_task = asyncio.create_task(
-                            self._auto_generate_loop()
-                        )
-                else:
-                    if self.auto_generating:
-                        logger.info(f"停止自动生成故事，时间: {current_hour}:00")
+                if not self.auto_generate_enabled:
+                    if self.auto_generating and self._auto_started:
+                        logger.info("自动补充题库已关闭，停止自动生成")
                         self.auto_generating = False
+                    await asyncio.sleep(300)
+                    continue
 
-                # 等待1小时后再次检查
-                await asyncio.sleep(3600)  # 1小时
+                self._ensure_story_storages()
+                storage_info = self.local_story_storage.get_storage_info()
+                generation_task = getattr(self, "_generation_loop_task", None)
+                generation_running = self.auto_generating or (
+                    generation_task is not None and not generation_task.done()
+                )
+                # 库存满时即使剩余不足也无法补充（需先重置使用记录），静默跳过
+                if (
+                    not generation_running
+                    and storage_info["remaining"] < self.auto_generate_min
+                    and storage_info["available"] > 0
+                ):
+                    logger.info(
+                        f"本地存储库剩余 {storage_info['remaining']} 道，"
+                        f"低于阈值 {self.auto_generate_min}，开始自动补充"
+                    )
+                    self.auto_generating = True
+                    self._auto_started = True
+                    self._generation_loop_task = asyncio.create_task(
+                        self._auto_generate_loop()
+                    )
+
+                # 等待5分钟后再次检查
+                await asyncio.sleep(300)  # 5分钟
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"自动生成任务错误: {e}")
-                await asyncio.sleep(3600)  # 出错后等待1小时再试
+                await asyncio.sleep(300)  # 出错后等待5分钟再试
 
     async def _auto_generate_loop(self):
         """自动生成循环"""
@@ -831,6 +842,7 @@ class SoupaiPlugin(Star):
             except Exception as e:
                 logger.error(f"自动生成故事错误: {e}")
                 await asyncio.sleep(300)  # 出错后等待5分钟再试
+        self._auto_started = False
 
     async def _jev_choice(
         self,
@@ -2577,6 +2589,12 @@ class SoupaiPlugin(Star):
         if storage_info["available"] <= 0:
             storage_full_warning = "\n⚠️ 本地存储库已满，自动生成已停止"
 
+        auto_generate_info = (
+            f"开启（剩余低于 {self.auto_generate_min} 道时补满）"
+            if self.auto_generate_enabled
+            else "已关闭"
+        )
+
         message = (
             f"📚 备用故事状态：\n"
             f"• 生成状态：{status}\n"
@@ -2585,7 +2603,7 @@ class SoupaiPlugin(Star):
             f"• 剩余题目：{storage_info['remaining']}\n"
             f"• 可用空间：{storage_info['available']}\n"
             f"• 网络题库：{online_info['total']} 个 (已用: {online_info['used']}, 剩余: {online_info['available']})\n"
-            f"• 自动生成时间：{self.auto_generate_start}:00-{self.auto_generate_end}:00{storage_full_warning}"
+            f"• 自动补充题库：{auto_generate_info}{storage_full_warning}"
         )
 
         yield event.plain_result(message)
@@ -2724,6 +2742,12 @@ class SoupaiPlugin(Star):
         else:
             judge_info = "LLM"
 
+        auto_generate_info = (
+            f"开启（剩余低于 {self.auto_generate_min} 道时补满）"
+            if self.auto_generate_enabled
+            else "已关闭"
+        )
+
         config_info = (
             f"⚙️ 海龟汤插件配置：\n"
             f"• 生成谜题 LLM：{self.generate_llm_provider_id or '默认'}\n"
@@ -2733,7 +2757,7 @@ class SoupaiPlugin(Star):
             f"• 游戏超时：{self.game_timeout} 秒\n"
             f"• 网络题库：{online_info['total']} 个谜题 (已用: {online_info['used']}, 剩余: {online_info['available']})\n"
             f"• 本地存储库：{local_info['total']}/{local_info['max_size']} (已用: {local_info['used']}, 剩余: {local_info['remaining']})\n"
-            f"• 自动生成时间：{self.auto_generate_start}:00-{self.auto_generate_end}:00\n"
+            f"• 自动补充题库：{auto_generate_info}\n"
             f"• 谜题来源策略：{strategy_name}\n"
             f"• 提问判定引擎：{judge_info}{storage_full_warning}"
         )

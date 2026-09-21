@@ -628,8 +628,7 @@ class SoupaiWebApi:
     _INT_RANGES = {
         "game_timeout": (30, 86400),
         "storage_max_size": (5, 500),
-        "auto_generate_start": (0, 23),
-        "auto_generate_end": (0, 23),
+        "auto_generate_min": (0, 500),
         "verification_limit": (0, 100),
     }
 
