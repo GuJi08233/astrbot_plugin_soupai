@@ -224,6 +224,23 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.storage.stories, [])
         self.assertTrue(result["data"]["warnings"])
 
+    async def test_failed_deletion_preserves_story_usage_and_annotation(self):
+        self.request.json.return_value = {"source": "custom", "id": "one"}
+        self.storage.usage = {"group": {"one"}}
+        self.storage.hidden_ids = {"one"}
+        before = [dict(story) for story in self.storage.stories]
+        self.storage.save_stories.side_effect = ValueError("Disk failure")
+
+        result = await self.api.story_delete()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(self.storage.stories, before)
+        self.assertEqual(self.storage.usage, {"group": {"one"}})
+        self.assertEqual(self.storage.hidden_ids, {"one"})
+        self.catalog.forget.assert_not_called()
+        self.storage.save_usage_record.assert_not_called()
+        self.storage.save_hidden_record.assert_not_called()
+
     async def test_create_uses_shared_admission_and_exposes_collision(self):
         self.request.json.return_value = {
             "source": "custom",

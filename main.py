@@ -268,11 +268,26 @@ class GameState:
         return True
 
     def end_game(self, group_id: str) -> bool:
-        """结束游戏"""
-        if group_id in self.active_games:
-            del self.active_games[group_id]
-            return True
-        return False
+        """End a round and cancel its message waiter.
+
+        Args:
+            group_id: Group whose round should end.
+
+        Returns:
+            Whether an active round was removed.
+        """
+        game = self.active_games.pop(group_id, None)
+        if game is None:
+            return False
+        game["is_active"] = False
+        task = game.get("_session_task")
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if task is not None and task is not current_task and not task.done():
+            task.cancel()
+        return True
 
     def get_game(self, group_id: str) -> dict | None:
         """获取游戏状态"""
@@ -394,7 +409,12 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
                     self.stories = json.load(f)
                 logger.info(f"从 {storage_path} 加载了 {len(self.stories)} 个故事")
                 if self._assign_missing_ids():
-                    self.save_stories()
+                    try:
+                        self.save_stories()
+                    except ValueError:
+                        logger.warning(
+                            "Loaded stories but could not persist assigned IDs"
+                        )
             else:
                 self.stories = []
                 logger.info("存储库文件不存在，创建新的存储库")
@@ -403,32 +423,41 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
             self.stories = []
 
     def save_stories(self):
-        """保存故事到文件"""
+        """Atomically persist the local bank.
+
+        Raises:
+            ValueError: Writing or replacing the bank failed.
+        """
+        storage_path = Path(self.storage_file)
+        temporary = storage_path.with_name(
+            f".{storage_path.name}.{uuid.uuid4().hex}.tmp"
+        )
         try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            # 确保目录存在
-            os.makedirs(os.path.dirname(storage_path), exist_ok=True)
-            with open(storage_path, "w", encoding="utf-8") as f:
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as f:
                 json.dump(self.stories, f, ensure_ascii=False, indent=2)
-            logger.info(f"保存了 {len(self.stories)} 个故事到 {storage_path}")
-        except Exception as e:
-            logger.error(f"保存故事失败: {e}")
+                f.flush()
+                os.fsync(f.fileno())
+            temporary.replace(storage_path)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error(f"Could not persist local stories: {exc}")
+            raise ValueError("题库保存失败，请检查数据目录后重试") from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Could not clean up story temporary file: {exc}")
 
     def add_story(self, puzzle: str, answer: str) -> bool:
         """添加故事到存储库"""
         with self.lock:
+            previous_stories = self.stories[:]
+            dropped_id = None
             if len(self.stories) >= self.max_size:
                 # 移除最旧的故事。使用记录按 id 保存，不会因此错位
                 dropped = self.stories.pop(0)
                 logger.info("存储库已满，移除最旧的故事")
                 dropped_id = dropped.get("id")
-                if dropped_id:
-                    for ids in self.usage.values():
-                        ids.discard(str(dropped_id))
 
             story = {
                 "id": uuid.uuid4().hex[:12],
@@ -437,7 +466,14 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
                 "created_at": datetime.now().isoformat(),
             }
             self.stories.append(story)
-            self.save_stories()
+            try:
+                self.save_stories()
+            except ValueError:
+                self.stories[:] = previous_stories
+                raise
+            if dropped_id:
+                for ids in self.usage.values():
+                    ids.discard(str(dropped_id))
             self.save_usage_record()
             logger.info(f"添加新故事到存储库，当前存储库大小: {len(self.stories)}")
             return True
@@ -483,7 +519,12 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
                     f"从 {storage_path} 加载了 {len(self.stories)} 个自定义海龟汤故事"
                 )
                 if self._assign_missing_ids():
-                    self.save_stories()
+                    try:
+                        self.save_stories()
+                    except ValueError:
+                        logger.warning(
+                            "Loaded stories but could not persist assigned IDs"
+                        )
             else:
                 self.stories = []
                 logger.info("自定义海龟汤文件不存在，创建新的存储库")
@@ -492,22 +533,30 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             self.stories = []
 
     def save_stories(self):
-        """保存自定义故事到文件"""
+        """Atomically persist the custom bank.
+
+        Raises:
+            ValueError: Writing or replacing the bank failed.
+        """
+        storage_path = Path(self.storage_file)
+        temporary = storage_path.with_name(
+            f".{storage_path.name}.{uuid.uuid4().hex}.tmp"
+        )
         try:
-            storage_path = (
-                self.storage_file
-                if isinstance(self.storage_file, str)
-                else str(self.storage_file)
-            )
-            # 确保目录存在
-            os.makedirs(os.path.dirname(storage_path), exist_ok=True)
-            with open(storage_path, "w", encoding="utf-8") as f:
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as f:
                 json.dump(self.stories, f, ensure_ascii=False, indent=2)
-            logger.info(
-                f"保存了 {len(self.stories)} 个自定义海龟汤故事到 {storage_path}"
-            )
-        except Exception as e:
-            logger.error(f"保存自定义海龟汤失败: {e}")
+                f.flush()
+                os.fsync(f.fileno())
+            temporary.replace(storage_path)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error(f"Could not persist custom stories: {exc}")
+            raise ValueError("题库保存失败，请检查数据目录后重试") from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Could not clean up story temporary file: {exc}")
 
     def add_story(self, puzzle: str, answer: str) -> bool:
         """添加自定义故事到存储库"""
@@ -519,7 +568,11 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
                 "created_at": datetime.now().isoformat(),
             }
             self.stories.append(story)
-            self.save_stories()
+            try:
+                self.save_stories()
+            except ValueError:
+                self.stories.pop()
+                raise
             logger.info(f"添加新自定义海龟汤故事，当前存储库大小: {len(self.stories)}")
             return True
 
@@ -559,16 +612,25 @@ class VerificationResult:
 class GroupSessionFilter(SessionFilter):
     """会话过滤器，确保每个群的会话独立"""
 
-    def __init__(self, group_id: str):
-        # 为每个会话保存其所属群 ID
+    def __init__(self, group_id: str, game: dict):
+        """Bind routing to one round, including while its waiter is closing.
+
+        Args:
+            group_id: Group allowed to send messages to this round.
+            game: Round state invalidated by GameState.end_game().
+        """
         self.group_id = group_id
+        self.game = game
+        self.session_id = f"soupai:{group_id}:{uuid.uuid4().hex}"
 
     def filter(self, event: AstrMessageEvent) -> str:
         current_group_id = (
             event.get_group_id() if event.get_group_id() else event.unified_msg_origin
         )
-        # 仅当事件来自该群时才返回有效的会话 ID，否则返回空串避免误触发
-        return self.group_id if current_group_id == self.group_id else ""
+        # A unique ID prevents an old waiter's cleanup from removing a new one.
+        if self.game["is_active"] and current_group_id == self.group_id:
+            return self.session_id
+        return ""
 
 
 class SoupaiPlugin(Star):
@@ -756,6 +818,14 @@ class SoupaiPlugin(Star):
 
     async def terminate(self):
         """插件卸载时清理资源"""
+        session_tasks = []
+        for group_id, game in list(self.game_state.active_games.items()):
+            task = game.get("_session_task")
+            if task is not None:
+                session_tasks.append(task)
+            self.game_state.end_game(group_id)
+        if session_tasks:
+            await asyncio.gather(*session_tasks, return_exceptions=True)
         # 停止自动生成
         self.auto_generating = False
         if self.auto_generate_task:
@@ -1258,12 +1328,18 @@ class SoupaiPlugin(Star):
                     if index < 0:
                         raise ValueError("题目不存在或已经删除")
                     story = storage.stories[index]
+                    previous_story = dict(story)
                     story.update(
                         puzzle=puzzle,
                         answer=answer,
                         updated_at=datetime.now().isoformat(),
                     )
-                    storage.save_stories()
+                    try:
+                        storage.save_stories()
+                    except ValueError:
+                        story.clear()
+                        story.update(previous_story)
+                        raise
                 else:
                     dropped_id = (
                         storage.stories[0].get("id")
@@ -1717,6 +1793,8 @@ class SoupaiPlugin(Star):
 
         self._ensure_story_storages()
 
+        game = None
+        generating = True
         try:
             # 标记正在生成谜题
             self.generating_games.add(group_id)
@@ -1745,7 +1823,6 @@ class SoupaiPlugin(Star):
                             puzzle_index = int(args[1])
                         except ValueError:
                             yield event.plain_result("题号必须是数字")
-                            self.generating_games.discard(group_id)
                             return
                 else:
                     # 第一个参数不是题库类型，可能是题号
@@ -1781,7 +1858,6 @@ class SoupaiPlugin(Star):
                     yield event.plain_result(
                         f"{source_type}题库中没有第 {puzzle_index} 号题目"
                     )
-                    self.generating_games.discard(group_id)
                     return
             else:
                 # 没有指定题号，根据策略随机获取
@@ -1797,13 +1873,11 @@ class SoupaiPlugin(Star):
                         yield event.plain_result(
                             "题库类型参数错误，请使用 network/local/custom"
                         )
-                        self.generating_games.discard(group_id)
                         return
                     story = storage.get_story(session)
 
             if not story:
                 yield event.plain_result("获取谜题失败，请重试")
-                self.generating_games.discard(group_id)
                 return
 
             puzzle, answer = story
@@ -1829,6 +1903,9 @@ class SoupaiPlugin(Star):
                 session=session,
                 started_at=datetime.now().isoformat(),
             ):
+                game = self.game_state.get_game(group_id)
+                self.generating_games.discard(group_id)
+                generating = False
                 extra = ""
                 if diff_conf["limit"] is not None:
                     extra = f"\n模式：{difficulty}（{diff_conf['limit']} 次提问"
@@ -1848,20 +1925,19 @@ class SoupaiPlugin(Star):
                 )
 
                 # 启动会话控制
-                await self._start_game_session(event, group_id)
+                if self.game_state.get_game(group_id) is game:
+                    await self._start_game_session(event, group_id)
             else:
                 yield event.plain_result("游戏启动失败，请重试")
 
-            # 移除生成状态，因为故事已经准备完成
-            self.generating_games.discard(group_id)
-            logger.info(f"群 {group_id} 故事准备完成，移除生成状态")
-
         except Exception as e:
             logger.error(f"启动游戏失败: {e}")
-            # 发生异常时也要移除生成状态
-            self.generating_games.discard(group_id)
-            logger.info(f"群 {group_id} 启动游戏异常，移除生成状态")
             yield event.plain_result(f"启动游戏时发生错误：{e}")
+        finally:
+            if generating:
+                self.generating_games.discard(group_id)
+            if game is not None and self.game_state.get_game(group_id) is game:
+                self.game_state.end_game(group_id)
 
     # 🔍 揭晓指令
     @filter.command("揭晓")
@@ -1900,6 +1976,9 @@ class SoupaiPlugin(Star):
     # 🎯 游戏会话控制
     async def _start_game_session(self, event: AstrMessageEvent, group_id: str):
         """启动游戏会话控制。答案每次从 game_state 现取，不在这里缓存"""
+        session_game = self.game_state.get_game(group_id)
+        if session_game is None:
+            return
         try:
 
             @session_waiter(timeout=self.game_timeout, record_history_chains=False)
@@ -1909,7 +1988,8 @@ class SoupaiPlugin(Star):
                 try:
                     # 从游戏状态获取答案，确保变量可用
                     game = self.game_state.get_game(group_id)
-                    if not game:
+                    if game is not session_game:
+                        controller.stop()
                         return
                     current_answer = game["answer"]
                     user_input = event.message_str.strip()
@@ -1929,12 +2009,18 @@ class SoupaiPlugin(Star):
                     normalized_input = user_input.lstrip("/").strip()
                     if normalized_input == "查看":
                         await self._handle_view_history_in_session(event, group_id)
-                        controller.keep(timeout=self.game_timeout, reset_timeout=True)
+                        if self.game_state.get_game(group_id) is session_game:
+                            controller.keep(
+                                timeout=self.game_timeout, reset_timeout=True
+                            )
                         return
                     if user_input in ("/提示", "提示"):
                         async for result in self.hint_command(event):
                             await event.send(result)
-                        controller.keep(timeout=self.game_timeout, reset_timeout=True)
+                        if self.game_state.get_game(group_id) is session_game:
+                            controller.keep(
+                                timeout=self.game_timeout, reset_timeout=True
+                            )
                         return
                     # 特殊处理 /验证 指令
                     if user_input.startswith("/验证"):
@@ -1980,7 +2066,7 @@ class SoupaiPlugin(Star):
                             )
                         return
                     # 特殊处理 /揭晓 指令
-                    if user_input == "揭晓":
+                    if normalized_input == "揭晓":
                         # 获取游戏信息并发送答案
                         game = self.game_state.get_game(group_id)
                         if game:
@@ -2024,6 +2110,15 @@ class SoupaiPlugin(Star):
                         event.unified_msg_origin,
                         game.get("puzzle", "") if game else "",
                     )
+                    if self.game_state.get_game(group_id) is not session_game:
+                        return
+                    if judged_by.get("engine") == "unavailable":
+                        await self._send_reply(event, f"{reply}（本次不计提问次数）")
+                        if self.game_state.get_game(group_id) is session_game:
+                            controller.keep(
+                                timeout=self.game_timeout, reset_timeout=True
+                            )
+                        return
 
                     # 记录提问和回答。judged_by 只给网页端的对局页看，
                     # 群里不显示——玩家没必要知道这一问是谁判的
@@ -2038,15 +2133,18 @@ class SoupaiPlugin(Star):
                         )
 
                     # 更新问题计数
-                    if question_limit is not None and game is not None:
-                        game["question_count"] = game.get("question_count", 0) + 1
+                    game["question_count"] = game.get("question_count", 0) + 1
+                    if question_limit is not None:
                         # 将判断结果和使用次数合并到一条消息中
                         combined_reply = (
                             f"{reply}（{game['question_count']}/{question_limit}）"
                         )
                         await self._send_reply(event, combined_reply)
 
-                        if game["question_count"] >= question_limit:
+                        if (
+                            self.game_state.get_game(group_id) is session_game
+                            and game["question_count"] >= question_limit
+                        ):
                             await self._safe_send(
                                 event,
                                 "❗️提问次数已用完，将进入验证环节。"
@@ -2058,9 +2156,12 @@ class SoupaiPlugin(Star):
                         await self._send_reply(event, reply)
 
                     # 重置超时时间
-                    controller.keep(timeout=self.game_timeout, reset_timeout=True)
+                    if self.game_state.get_game(group_id) is session_game:
+                        controller.keep(timeout=self.game_timeout, reset_timeout=True)
 
                 except Exception as e:
+                    if self.game_state.get_game(group_id) is not session_game:
+                        return
                     logger.error(f"会话控制内部错误: {e}")
                     # 先结束游戏再发消息，确保发送失败也不会残留状态
                     self.game_state.end_game(group_id)
@@ -2068,13 +2169,21 @@ class SoupaiPlugin(Star):
                     await self._safe_send(event, f"游戏处理过程中发生错误：{e}")
 
             try:
-                # 使用群 ID 限制会话范围，避免多个群并发时互相触发
-                await game_session_waiter(
-                    event, session_filter=GroupSessionFilter(group_id)
+                session_task = asyncio.create_task(
+                    game_session_waiter(
+                        event,
+                        session_filter=GroupSessionFilter(group_id, session_game),
+                    )
                 )
+                session_game["_session_task"] = session_task
+                await session_task
+            except asyncio.CancelledError:
+                # Explicitly ending a round cancels only its child waiter.
+                if self.game_state.get_game(group_id) is session_game:
+                    raise
             except TimeoutError:
                 game = self.game_state.get_game(group_id)
-                if game:
+                if game is session_game:
                     true_answer = game["answer"]
                     # 先清状态再发消息：平台掉线时 send 会抛异常，
                     # 若先发后清，本局将永久卡在「进行中」而无法重开
@@ -2084,16 +2193,20 @@ class SoupaiPlugin(Star):
                         f"⏰ 游戏超时！\n\n📖 完整故事：{true_answer}\n\n游戏结束！",
                     )
             except Exception as e:
+                if self.game_state.get_game(group_id) is not session_game:
+                    return
                 logger.error(f"游戏会话错误: {e}")
                 self.game_state.end_game(group_id)
                 await self._safe_send(event, f"游戏过程中发生错误：{e}")
             finally:
                 # 会话监听器已退出，此后没有任何消息会被处理。
                 # 无论因何种原因退出，都必须清掉残留状态，否则 /汤 无法重开
-                if self.game_state.is_game_active(group_id):
+                if self.game_state.get_game(group_id) is session_game:
                     logger.warning(f"会话已结束但游戏状态残留，强制清理: {group_id}")
                     self.game_state.end_game(group_id)
         except Exception as e:
+            if self.game_state.get_game(group_id) is not session_game:
+                return
             logger.error(f"启动游戏会话失败: {e}")
             self.game_state.end_game(group_id)
             await self._safe_send(event, f"启动游戏会话失败：{e}")
@@ -2274,6 +2387,9 @@ class SoupaiPlugin(Star):
         self, event: AstrMessageEvent, group_id: str
     ):
         """在会话控制中处理强制结束游戏逻辑"""
+        if not event.is_admin():
+            await self._send_reply(event, "❌ 只有管理员可以强制结束游戏")
+            return
         try:
             if self.game_state.end_game(group_id):
                 await event.send(event.plain_result("✅ 已强制结束当前海龟汤游戏"))
@@ -2344,6 +2460,8 @@ class SoupaiPlugin(Star):
             allow_list,
             event.unified_msg_origin,
         )
+        if self.game_state.get_game(group_id) is not game:
+            return None
         game["hint_count"] = hint_count + 1
         game["hint_history"] = hint_history + [hint]
         suffix = ""
@@ -2368,6 +2486,8 @@ class SoupaiPlugin(Star):
         try:
             group_id = event.get_group_id()
             game = self.game_state.get_game(group_id) if group_id else None
+            if game is None:
+                return
 
             # 先检查次数：验证机会全程有限，不论提问次数是否用完（issue #22）
             if game is not None and self.verification_limit > 0:
@@ -2384,6 +2504,8 @@ class SoupaiPlugin(Star):
             result = await self.verify_user_guess(
                 user_guess, answer, event.unified_msg_origin
             )
+            if self.game_state.get_game(group_id) is not game:
+                return
 
             accept_levels = (
                 game.get("accept_levels", ["完全还原", "核心推理正确"])

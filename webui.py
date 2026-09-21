@@ -345,8 +345,12 @@ class SoupaiWebApi:
                 index = storage.find_index(story_id)
                 if index < 0:
                     return error_response("题目不存在")
-                del storage.stories[index]
-                storage.save_stories()
+                removed = storage.stories.pop(index)
+                try:
+                    storage.save_stories()
+                except ValueError as exc:
+                    storage.stories.insert(index, removed)
+                    return error_response(str(exc))
                 for ids in storage.usage.values():
                     ids.discard(story_id)
                 storage.hidden_ids.discard(story_id)
@@ -617,7 +621,11 @@ class SoupaiWebApi:
         key = (data.get("key") or "").strip()
         if not key:
             return error_response("需要指定对局")
+        game = self.plugin.game_state.get_game(key)
         ended = self.plugin.game_state.end_game(key)
+        task = game.get("_session_task") if game else None
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
         if ended:
             logger.info(f"网页端强制结束对局 {key} by {request.username}")
         return _ok({"ended": ended})

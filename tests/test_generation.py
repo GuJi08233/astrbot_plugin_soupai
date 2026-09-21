@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import test_judging as judging_runtime
 
@@ -123,6 +123,80 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.story_catalog.remember.assert_called_once_with(
             "custom", story_id, "修改题面", "修改汤底", annotation
         )
+
+    async def test_failed_initial_write_does_not_report_or_retain_a_saved_story(self):
+        for source, storage in self.storages.items():
+            with self.subTest(source=source):
+                with patch.object(
+                    Path, "open", side_effect=PermissionError("Read only")
+                ):
+                    with self.assertRaisesRegex(ValueError, "保存失败"):
+                        await self.plugin.save_story_checked(
+                            source, "New puzzle", "New answer"
+                        )
+                self.assertEqual(storage.stories, [])
+                self.assertFalse(Path(storage.storage_file).exists())
+        self.plugin.story_catalog.remember.assert_not_called()
+
+    async def test_failed_replacement_preserves_full_bank_and_usage(self):
+        self.local.max_size = 1
+        for source, storage in self.storages.items():
+            with self.subTest(source=source):
+                storage.add_story("Original puzzle", "Original answer")
+                old_story = dict(storage.stories[0])
+                storage.mark_used("group", old_story["id"])
+                before = Path(storage.storage_file).read_bytes()
+                with patch.object(Path, "replace", side_effect=OSError("Disk failure")):
+                    with self.assertRaisesRegex(ValueError, "保存失败"):
+                        await self.plugin.save_story_checked(
+                            source, "New puzzle", "New answer"
+                        )
+                self.assertEqual(storage.stories, [old_story])
+                self.assertEqual(storage.used_ids("group"), {old_story["id"]})
+                self.assertEqual(Path(storage.storage_file).read_bytes(), before)
+                self.assertEqual(list(self.data_path.glob("*.tmp")), [])
+        self.plugin.story_catalog.forget.assert_not_called()
+        self.plugin.story_catalog.remember.assert_not_called()
+
+    async def test_partial_serialization_does_not_truncate_bank_or_commit_edit(self):
+        def fail_after_partial_write(value, stream, **kwargs):
+            stream.write('[{"partial":')
+            raise OSError("Disk full")
+
+        for source, storage in self.storages.items():
+            with self.subTest(source=source):
+                storage.add_story("Original puzzle", "Original answer")
+                original = dict(storage.stories[0])
+                before = Path(storage.storage_file).read_bytes()
+                with patch.object(
+                    self.module.json, "dump", side_effect=fail_after_partial_write
+                ):
+                    with self.assertRaisesRegex(ValueError, "保存失败"):
+                        await self.plugin.save_story_checked(
+                            source,
+                            "Edited puzzle",
+                            "Edited answer",
+                            story_id=original["id"],
+                        )
+                self.assertEqual(storage.stories, [original])
+                self.assertEqual(Path(storage.storage_file).read_bytes(), before)
+                self.assertEqual(list(self.data_path.glob("*.tmp")), [])
+        self.plugin.story_catalog.remember.assert_not_called()
+
+    def test_failed_id_migration_keeps_loaded_stories(self):
+        for storage_type in (
+            self.module.LocalSoupaiStorage,
+            self.module.CustomSoupaiStorage,
+        ):
+            with self.subTest(storage_type=storage_type.__name__):
+                path = self.data_path / "legacy.json"
+                original = [{"puzzle": "Legacy puzzle", "answer": "Legacy answer"}]
+                path.write_text(json.dumps(original), encoding="utf-8")
+                with patch.object(Path, "replace", side_effect=OSError("Read only")):
+                    storage = storage_type(path, data_path=self.data_path)
+                self.assertEqual(len(storage.stories), 1)
+                self.assertEqual(storage.stories[0]["puzzle"], "Legacy puzzle")
+                self.assertEqual(json.loads(path.read_text("utf-8")), original)
 
     async def test_deleted_story_is_not_recreated_after_check_returns(self):
         self.custom.add_story("原题面", "原汤底")
