@@ -459,6 +459,8 @@
       return el('span', 'tag tag-jev', `Jev${c}`);
     }
     if (by.engine === 'llm') {
+      if (by.routing_reason === 'context_required') return el('span', 'tag tag-llm', 'LLM · 追问判定');
+      if (by.routing_reason === 'compound_question') return el('span', 'tag tag-llm', 'LLM · 复合提问');
       return by.fallback
         ? el('span', 'tag tag-fallback', 'LLM · Jev 回退')
         : el('span', 'tag tag-llm', 'LLM');
@@ -533,7 +535,7 @@
           if (by) li.appendChild(by);
           const judgement = qa.judged_by || {};
           const jev = judgement.jev;
-          if (jev || judgement.engine === 'jev' || judgement.fallback) {
+          if (jev || judgement.engine === 'jev' || (judgement.fallback && !judgement.routing_reason)) {
             const metrics = el('details', 'judge-details');
             metrics.dataset.detailKey = `${g.key}:${g.started_at || ''}:judge:${index}`;
             metrics.open = expanded.has(metrics.dataset.detailKey);

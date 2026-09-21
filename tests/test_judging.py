@@ -1,5 +1,6 @@
 """Regression tests for Jev diagnostics and independent hint providers."""
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -423,6 +424,213 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.judge_provider.text_chat.assert_awaited_once()
         self.hint_provider.text_chat.assert_not_awaited()
         self.verify_provider.text_chat.assert_not_awaited()
+
+    async def test_followup_uses_player_context_without_an_extra_jev_request(self):
+        history = [{"question": "救援人员救的是小秋吗？", "answer": "是"}]
+        reply, source = await self.plugin.judge_question(
+            "那她当时戴着项链吗？",
+            "小夏戴着项链，小秋没戴。",
+            "session-one",
+            "母亲认错了双胞胎。",
+            qa_history=history,
+        )
+        self.assertEqual(reply, "否")
+        self.assertEqual(source["routing_reason"], "context_required")
+        self.assertFalse(source["fallback"])
+        self.assertNotIn("jev", source)
+        self.client_factory.assert_not_called()
+        payload = json.loads(self.judge_provider.text_chat.call_args.kwargs["prompt"])
+        self.assertEqual(payload["相关问答"], history)
+        self.assertEqual(payload["谜面"], "母亲认错了双胞胎。")
+        self.plugin.context.get_provider_by_id.assert_called_once_with("judge")
+
+    async def test_followup_without_context_asks_for_clarification_without_models(self):
+        for engine in ("jev", "llm"):
+            with self.subTest(engine=engine):
+                self.plugin.judge_engine = engine
+                reply, source = await self.plugin.judge_question(
+                    "那她也进去了吗？", "Story"
+                )
+                self.assertEqual(source["engine"], "unavailable")
+                self.assertIn("具体人物", reply)
+        self.client_factory.assert_not_called()
+        self.judge_provider.text_chat.assert_not_awaited()
+
+    async def test_compound_claims_use_llm_but_single_negations_still_use_jev(self):
+        self.judge_provider.text_chat.return_value.completion_text = "是也不是。"
+        for question in (
+            "医生关了灯，护士也进来了，对吗？",
+            "他在十楼上班，而且车也停在十楼，对吗？",
+            "他既借了书又卖掉了书吗？",
+        ):
+            with self.subTest(question=question):
+                reply, source = await self.plugin.judge_question(question, "Story")
+                self.assertEqual(reply, "是也不是")
+                self.assertEqual(source["routing_reason"], "compound_question")
+                self.assertNotIn("jev", source)
+        self.client_factory.assert_not_called()
+        reply, source = await self.plugin.judge_question(
+            "他并不是没有坐电梯，对吗？", "Story"
+        )
+        self.assertEqual(source["engine"], "jev")
+
+    async def test_disabled_or_unavailable_review_asks_to_split_instead_of_guessing(
+        self,
+    ):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                self.plugin.judge_fallback_to_llm = fallback
+                self.providers.clear()
+                reply, source = await self.plugin.judge_question(
+                    "医生关了灯，护士也进来了，对吗？", "Story"
+                )
+                self.assertEqual(source["engine"], "unavailable")
+                self.assertIn("拆成", reply)
+        self.client_factory.assert_not_called()
+        self.judge_provider.text_chat.assert_not_awaited()
+
+    async def test_engines_share_facts_and_criteria_and_history_is_bounded(self):
+        history = [{"question": f"Question {i}", "answer": "是"} for i in range(8)]
+        await self.plugin.judge_question(
+            "现在检查灯光吗？",
+            "Secret story",
+            puzzle="Public puzzle",
+            qa_history=history,
+        )
+        jev = json.loads(self.requests[-1].content)
+        self.assertEqual(len(jev["state"]["相关问答"]), 3)
+        self.assertEqual(jev["state"]["相关问答"][0]["question"], "Question 5")
+        self.plugin.judge_engine = "llm"
+        await self.plugin.judge_question(
+            "现在检查灯光吗？",
+            "Secret story",
+            puzzle="Public puzzle",
+            qa_history=history,
+        )
+        llm = self.judge_provider.text_chat.call_args.kwargs
+        self.assertEqual(json.loads(llm["prompt"]), jev["state"])
+        self.assertIn(jev["questions"]["verdict"]["instructions"], llm["system_prompt"])
+        for value in jev["questions"]["verdict"]["criteria"].values():
+            self.assertIn(value, llm["system_prompt"])
+
+    async def test_history_drops_invalid_answers_and_unrelated_metadata(self):
+        history = [
+            {"question": "Bad", "answer": ["是"]},
+            {"question": "Error", "answer": "Service unavailable"},
+            {"question": "Valid", "answer": "否", "secret": "must not be sent"},
+        ]
+        await self.plugin.judge_question("Check?", "Story", qa_history=history)
+        payload = json.loads(self.requests[-1].content)
+        self.assertEqual(
+            payload["state"]["相关问答"], [{"question": "Valid", "answer": "否"}]
+        )
+
+    async def test_blank_or_oversized_questions_never_call_a_model(self):
+        for question in ("   ", "问" * 2001):
+            _, source = await self.plugin.judge_question(question, "Story")
+            self.assertEqual(source["engine"], "unavailable")
+        self.client_factory.assert_not_called()
+        self.judge_provider.text_chat.assert_not_awaited()
+
+    async def test_llm_clarification_and_prose_never_become_a_verdict(self):
+        self.plugin.judge_engine = "llm"
+        for reply in (
+            "需要澄清",
+            "是，因为实际情况是秘密。",
+            "是也不是，原因是秘密",
+            "不是",
+        ):
+            with self.subTest(reply=reply):
+                self.judge_provider.text_chat.return_value.completion_text = reply
+                text, source = await self.plugin.judge_question("Check?", "Story")
+                self.assertEqual(source["engine"], "unavailable")
+                self.assertNotIn("秘密", text)
+        for reply in ("是也不是。", "“否”", " 是！ "):
+            self.judge_provider.text_chat.return_value.completion_text = reply
+            text, source = await self.plugin.judge_question("Check?", "Story")
+            self.assertEqual(source["engine"], "llm")
+            self.assertIn(text, self.plugin._JUDGE_CRITERIA)
+        self.client_factory.assert_not_called()
+
+    async def test_provider_resolution_failure_is_a_retryable_judgment_failure(self):
+        self.plugin.judge_engine = "llm"
+        self.plugin.context.get_provider_by_id.side_effect = RuntimeError(
+            "Provider unavailable"
+        )
+        reply, source = await self.plugin.judge_question("Check?", "Story")
+        self.assertEqual(source["engine"], "unavailable")
+        self.assertIn("重试", reply)
+        self.judge_provider.text_chat.assert_not_awaited()
+
+    async def test_judge_cancellation_propagates_without_triggering_fallback(self):
+        self.request_error = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.plugin.judge_question("Check?", "Story")
+        self.judge_provider.text_chat.assert_not_awaited()
+
+    async def test_total_request_timeouts_cancel_pending_operations(self):
+        real_wait_for = asyncio.wait_for
+        limits = []
+
+        async def short_wait(awaitable, timeout):
+            limits.append(timeout)
+            return await real_wait_for(awaitable, timeout=0.02)
+
+        async def pending(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with patch.object(self.module.asyncio, "wait_for", side_effect=short_wait):
+            self.plugin._jev_client = SimpleNamespace(
+                post=AsyncMock(side_effect=pending)
+            )
+            reply, source = await self.plugin.judge_question("Check?", "Story")
+            self.assertEqual(reply, "否")
+            self.assertEqual(source["jev"]["reason"], "request_failed")
+            self.assertEqual(limits, [15.0, 60.0])
+            self.plugin.judge_engine = "llm"
+            self.judge_provider.text_chat.side_effect = pending
+            _, source = await self.plugin.judge_question("Check?", "Story")
+            self.assertEqual(source["engine"], "unavailable")
+
+    async def test_config_changes_reuse_pool_and_apply_current_credentials(self):
+        await self.plugin.judge_question("First?", "Story")
+        client = self.plugin._jev_client
+        self.plugin.config.update(
+            jev_base_url="https://other.test/v1/", jev_api_key="new-test-key"
+        )
+        self.plugin._load_config()
+        self.assertIs(self.plugin._jev_client, client)
+        await self.plugin.judge_question("Second?", "Story")
+        self.assertEqual(self.client_factory.call_count, 1)
+        self.assertEqual(
+            str(self.requests[0].url), "https://typesafe.test/v1/systemone"
+        )
+        self.assertEqual(self.requests[0].headers["Authorization"], "Bearer test-key")
+        self.assertEqual(str(self.requests[1].url), "https://other.test/v1/systemone")
+        self.assertEqual(
+            self.requests[1].headers["Authorization"], "Bearer new-test-key"
+        )
+
+    async def test_contradictory_distributions_and_wrong_answer_types_fall_back(self):
+        for probabilities in (
+            {"是": 0.1, "否": 0.8, "不重要": 0.05, "是也不是": 0.05},
+            {"是": 0.8, "否": 0.8, "不重要": 0.8, "是也不是": 0.8},
+        ):
+            self.answer["probabilities"] = probabilities
+            _, source = await self.plugin.judge_question("Check?", "Story")
+            self.assertEqual(source["engine"], "llm")
+            self.assertEqual(source["jev"]["reason"], "invalid_response")
+            self.assertEqual(source["jev"]["probabilities"], probabilities)
+        self.answer["type"] = "score"
+        _, source = await self.plugin.judge_question("Check?", "Story")
+        self.assertEqual(source["jev"]["reason"], "invalid_response")
+
+    def test_invalid_threshold_config_uses_safe_default(self):
+        for value in (None, "invalid", -1, 1.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                self.plugin.config["jev_judge_min_confidence"] = value
+                self.plugin._load_config()
+                self.assertEqual(self.plugin.jev_judge_min_confidence, 0.5)
 
     async def test_hints_use_only_the_hint_provider(self):
         hint = await self.plugin.generate_hint(

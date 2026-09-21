@@ -733,6 +733,8 @@ class SoupaiWebApi:
                     value = float(value)
                 except (TypeError, ValueError):
                     return error_response(f"{key} 需要是数字")
+                if key == "jev_judge_min_confidence" and not 0 <= value <= 1:
+                    return error_response("Jev 置信度门槛需要在 0 ~ 1 之间")
             elif ftype == "bool":
                 value = bool(value)
             elif ftype == "string":

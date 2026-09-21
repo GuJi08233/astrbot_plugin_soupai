@@ -97,6 +97,19 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._resolve_provider.assert_not_called()
         self.assertIsNone(self.api.annotation_task)
 
+    async def test_invalid_confidence_threshold_never_reaches_config_storage(self):
+        class Config(dict):
+            schema = {"jev_judge_min_confidence": {"type": "float"}}
+            save_config = Mock()
+
+        self.plugin.config = Config()
+        for value in (-0.1, 1.1, "NaN", "Infinity"):
+            with self.subTest(value=value):
+                self.request.json.return_value = {"jev_judge_min_confidence": value}
+                result = await self.api.config_save()
+                self.assertEqual(result["status"], "error")
+        self.plugin.config.save_config.assert_not_called()
+
     async def test_force_preview_includes_already_annotated_stories(self):
         self.request.query = {"source": "network", "force": "1"}
         self.catalog.annotation_status.return_value = "ready"

@@ -108,6 +108,7 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
             message_str=message,
             unified_msg_origin="test:GroupMessage:group",
             get_group_id=lambda: "group",
+            get_sender_id=lambda: "player-one",
             plain_result=lambda text: text,
             send=AsyncMock(),
             is_admin=Mock(return_value=admin),
@@ -241,6 +242,41 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(game["question_count"], 1)
         self.assertEqual(self.plugin._send_reply.call_args.args[1], "是")
 
+    async def test_question_context_is_per_player_and_only_retains_successes(self):
+        game, waiter = await self.start_round()
+        for message in (
+            "First question",
+            "Second question",
+            "Third question",
+            "Fourth question",
+        ):
+            await self.runtime.SessionWaiter.trigger(
+                waiter.session_id, self.event(message)
+            )
+        self.assertEqual(len(game["_player_qa"]["player-one"]), 3)
+        other = self.event("Other player's question")
+        other.get_sender_id = lambda: "player-two"
+        await self.runtime.SessionWaiter.trigger(waiter.session_id, other)
+        self.assertEqual(self.plugin.judge_question.call_args.kwargs["qa_history"], [])
+        self.plugin.judge_question.return_value = (
+            "请说明具体人物",
+            {"engine": "unavailable"},
+        )
+        await self.runtime.SessionWaiter.trigger(
+            waiter.session_id, self.event("那他呢？")
+        )
+        self.assertEqual(
+            [
+                item["question"]
+                for item in self.plugin.judge_question.call_args.kwargs["qa_history"]
+            ],
+            ["Second question", "Third question", "Fourth question"],
+        )
+        self.assertEqual(game["question_count"], 5)
+        self.assertEqual(len(game["qa_history"]), 5)
+        self.assertEqual(len(game["_player_qa"]["player-one"]), 3)
+        self.assertNotIn("sender_id", game["qa_history"][0])
+
     async def test_late_model_results_do_not_reply_to_or_end_a_new_round(self):
         for method, message, result in (
             ("judge_question", "Question", ("是", {"engine": "llm"})),
@@ -256,7 +292,7 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
                 game["qa_history"] = [{"question": "Earlier question", "answer": "是"}]
                 entered, release = asyncio.Event(), asyncio.Event()
 
-                async def delayed(*args):
+                async def delayed(*args, **kwargs):
                     entered.set()
                     await release.wait()
                     return result
