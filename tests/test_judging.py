@@ -94,7 +94,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.verify_provider = SimpleNamespace(
             text_chat=AsyncMock(
                 return_value=SimpleNamespace(
-                    completion_text="等级：完全还原\n评价：推理正确"
+                    completion_text="事实：95\n动机：90\n反转：95\n评价：推理正确"
                 )
             )
         )
@@ -695,7 +695,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         del self.plugin.config["verify_llm_provider"]
         self.plugin._load_config()
         self.judge_provider.text_chat.return_value = SimpleNamespace(
-            completion_text="等级：完全还原\n评价：推理正确"
+            completion_text="事实：95\n动机：90\n反转：95\n评价：推理正确"
         )
 
         result = await self.plugin.verify_user_guess(
@@ -729,7 +729,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blank_verify_provider_follows_judge_provider(self):
         self.judge_provider.text_chat.return_value = SimpleNamespace(
-            completion_text="等级：完全还原\n评价：推理正确"
+            completion_text="事实：95\n动机：90\n反转：95\n评价：推理正确"
         )
         for verify_provider in ("", "   ", None):
             with self.subTest(verify_provider=verify_provider):
@@ -752,7 +752,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["judge_llm_provider"] = ""
         self.plugin._load_config()
         self.default_provider.text_chat.return_value = SimpleNamespace(
-            completion_text="等级：完全还原\n评价：推理正确"
+            completion_text="事实：95\n动机：90\n反转：95\n评价：推理正确"
         )
 
         result = await self.plugin.verify_user_guess(
@@ -803,6 +803,80 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.hint_provider.text_chat.assert_not_awaited()
         self.default_provider.text_chat.assert_not_awaited()
         self.client_factory.assert_not_called()
+
+    def test_verification_score_is_the_weighted_average_of_its_parts(self):
+        result = self.plugin._parse_verification_result(
+            "事实：80\n动机：60\n反转：40\n评价：主干接近"
+        )
+
+        # 0.35*80 + 0.25*60 + 0.40*40 = 59
+        self.assertEqual(result.score, 59)
+        self.assertEqual(result.breakdown, {"facts": 80, "motive": 60, "twist": 40})
+        self.assertEqual(result.comment, "主干接近")
+        self.assertEqual(result.level, "部分正确")
+        self.assertFalse(result.is_correct)
+
+    def test_verification_tolerates_half_width_colons_and_stray_lines(self):
+        result = self.plugin._parse_verification_result(
+            "这是多余的前言\n事实: 90\n动机：90\n反转: 90\n评价: 很接近了\n多余的解释"
+        )
+
+        self.assertEqual(result.score, 90)
+        self.assertEqual(result.comment, "很接近了")
+        self.assertEqual(result.level, "完全还原")
+
+    def test_verification_renormalizes_when_a_dimension_is_missing(self):
+        result = self.plugin._parse_verification_result(
+            "事实：80\n反转：40\n评价：少了一项"
+        )
+
+        # 缺动机时按剩下的 0.35 / 0.40 归一化，而不是把缺项当 0 分
+        self.assertEqual(result.score, 59)
+        self.assertEqual(result.breakdown, {"facts": 80, "twist": 40})
+
+    def test_verification_clamps_out_of_range_scores(self):
+        result = self.plugin._parse_verification_result(
+            "事实：120\n动机：100\n反转：999\n评价：越界"
+        )
+
+        self.assertEqual(result.breakdown, {"facts": 100, "motive": 100, "twist": 100})
+        self.assertEqual(result.score, 100)
+
+    def test_verification_without_any_score_line_reports_no_score(self):
+        result = self.plugin._parse_verification_result("我无法评价这段推理。")
+
+        # score=None 让调用方放弃本次验证，而不是当成 0 分扣掉一次机会
+        self.assertIsNone(result.score)
+        self.assertEqual(result.level, "验证失败")
+        self.assertFalse(result.is_correct)
+
+    def test_verification_falls_back_to_a_spoiler_free_comment(self):
+        result = self.plugin._parse_verification_result("事实：20\n动机：20\n反转：20")
+
+        self.assertEqual(result.score, 20)
+        self.assertEqual(result.comment, "方向偏了，换个角度重新想想。")
+
+    def test_pass_score_prefers_the_config_override_then_the_round(self):
+        self.plugin.difficulty_settings = {
+            "普通": {"limit": 35, "pass_score": 70, "hint_limit": 5}
+        }
+        self.plugin.verification_pass_score = 0
+
+        self.assertEqual(self.plugin._pass_score_for({"pass_score": 90}), 90)
+        self.assertEqual(self.plugin._pass_score_for(None), 70)
+        # 对局里的值不可信时同样回落到普通难度
+        self.assertEqual(self.plugin._pass_score_for({"pass_score": 0}), 70)
+        self.assertEqual(self.plugin._pass_score_for({"pass_score": "80"}), 70)
+
+        self.plugin.verification_pass_score = 55
+        self.assertEqual(self.plugin._pass_score_for({"pass_score": 90}), 55)
+
+    def test_invalid_pass_score_config_falls_back_to_difficulty(self):
+        for raw in (-1, 101, "abc", None):
+            with self.subTest(raw=raw):
+                self.plugin.config["verification_pass_score"] = raw
+                self.plugin._load_config()
+                self.assertEqual(self.plugin.verification_pass_score, 0)
 
 
 if __name__ == "__main__":

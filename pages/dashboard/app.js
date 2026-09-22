@@ -515,11 +515,17 @@
 
       const q = g.question_limit ? `${g.question_count}/${g.question_limit}` : `${g.question_count}（不限）`;
       const h = g.hint_limit ? `${g.hint_count}/${g.hint_limit}` : '不可用';
-      const v = data.verification_limit > 0
-        ? `${g.verification_attempts}/${data.verification_limit}` : `${g.verification_attempts}（不限）`;
+      // 达标后的验证不再计次，显示次数会让人以为还在扣
+      const v = g.passed
+        ? `已达标（不再计次）`
+        : (data.verification_limit > 0
+          ? `${g.verification_attempts}/${data.verification_limit}` : `${g.verification_attempts}（不限）`);
+      const score = g.best_score
+        ? ` · 最高分 ${g.best_score}/100（达标线 ${g.pass_score}）`
+        : ` · 达标线 ${g.pass_score}`;
       const summary = judgeSummary(g.qa_history || []);
       card.appendChild(el('p', 'muted',
-        `提问 ${q} · 提示 ${h} · 验证 ${v}${summary ? ` · 判定 ${summary}` : ''}`));
+        `提问 ${q} · 提示 ${h} · 验证 ${v}${score}${summary ? ` · 判定 ${summary}` : ''}`));
 
       if (g.qa_history && g.qa_history.length) {
         const details = el('details', 'qa');

@@ -271,6 +271,9 @@ class SoupaiWebApi:
                     "hint_count": game.get("hint_count", 0),
                     "hint_limit": game.get("hint_limit"),
                     "verification_attempts": game.get("verification_attempts", 0),
+                    "pass_score": self.plugin._pass_score_for(game),
+                    "best_score": int(game.get("best_score") or 0),
+                    "passed": bool(game.get("passed")),
                     "qa_history": game.get("qa_history", []),
                 }
             )
@@ -638,6 +641,7 @@ class SoupaiWebApi:
         "storage_max_size": (5, 500),
         "auto_generate_min": (0, 500),
         "verification_limit": (0, 100),
+        "verification_pass_score": (0, 100),
     }
 
     def _providers_payload(self, kind: str = "chat") -> list[dict]:

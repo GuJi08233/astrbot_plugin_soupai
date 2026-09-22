@@ -67,7 +67,7 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.generating_games = set()
         self.plugin.group_difficulty = {}
         self.plugin.difficulty_settings = {
-            "普通": {"limit": 35, "accept_levels": ["完全还原"], "hint_limit": 5}
+            "普通": {"limit": 35, "pass_score": 70, "hint_limit": 5}
         }
         self.plugin._ensure_story_storages = Mock()
         self.plugin.get_story_by_strategy = AsyncMock(
@@ -283,7 +283,7 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
             (
                 "verify_user_guess",
                 "验证 Answer",
-                self.module.VerificationResult("完全还原", "Correct"),
+                self.module.VerificationResult("完全还原", "Correct", True, 95, {}),
             ),
             ("generate_hint", "提示", "A synthetic hint"),
         ):
@@ -345,6 +345,123 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.terminate()
         self.assertFalse(self.plugin.game_state.is_game_active("group"))
         self.assertEqual(self.runtime.USER_SESSIONS, {})
+
+    async def verify_with_score(self, waiter, score, breakdown=None):
+        """Submit one /验证 whose judged score is fixed.
+
+        Args:
+            waiter: Registered waiter of the round under test.
+            score: Score the verification model should report, or None to
+                simulate a judgement that never completed.
+            breakdown: Optional per-dimension scores.
+
+        Returns:
+            Nothing; assertions read the round state and recorded replies.
+        """
+        level, _ = self.module.SoupaiPlugin._score_band(score or 0)
+        result = self.module.VerificationResult(
+            level, "Synthetic comment", False, score, breakdown or {}
+        )
+        with patch.object(
+            self.plugin, "verify_user_guess", AsyncMock(return_value=result)
+        ):
+            await self.runtime.SessionWaiter.trigger(
+                waiter.session_id, self.event("验证 Synthetic guess")
+            )
+
+    async def test_passing_score_keeps_the_round_open_without_charging(self):
+        game, waiter = await self.start_round()
+
+        await self.verify_with_score(waiter, 78)
+
+        # 达标不收场：玩家还能继续提问、继续验证冲高分
+        self.assertIs(self.plugin.game_state.get_game("group"), game)
+        self.assertTrue(game["passed"])
+        self.assertEqual(game["best_score"], 78)
+        self.assertEqual(game["verification_attempts"], 0)
+        reply = self.plugin._send_reply.call_args.args[1]
+        self.assertIn("78/100", reply)
+        self.assertIn("达标", reply)
+        # 游戏还在进行，LLM 评价会变成免费提示，不能回给玩家
+        self.assertNotIn("Synthetic comment", reply)
+
+        # 达标后再验证仍然不计次，且最高分只升不降
+        await self.verify_with_score(waiter, 72)
+        self.assertEqual(game["verification_attempts"], 0)
+        self.assertEqual(game["best_score"], 78)
+
+    async def test_failing_score_charges_an_attempt_and_reports_the_gap(self):
+        game, waiter = await self.start_round()
+
+        await self.verify_with_score(waiter, 64)
+
+        self.assertIs(self.plugin.game_state.get_game("group"), game)
+        self.assertFalse(game["passed"])
+        self.assertEqual(game["best_score"], 64)
+        self.assertEqual(game["verification_attempts"], 1)
+        reply = self.plugin._send_reply.call_args.args[1]
+        self.assertIn("64/100", reply)
+        self.assertIn("还差 6 分", reply)
+        self.assertNotIn("Synthetic comment", reply)
+
+    async def test_unjudged_verification_does_not_charge_an_attempt(self):
+        game, waiter = await self.start_round()
+
+        await self.verify_with_score(waiter, None)
+
+        self.assertIs(self.plugin.game_state.get_game("group"), game)
+        self.assertEqual(game["verification_attempts"], 0)
+        self.assertEqual(game.get("best_score"), 0)
+        self.assertIn("不计入", self.plugin._send_reply.call_args.args[1])
+
+    async def test_perfect_score_ends_the_round_and_reveals_the_answer(self):
+        game, waiter = await self.start_round()
+
+        await self.verify_with_score(waiter, 100)
+        await asyncio.gather(game["_session_task"], return_exceptions=True)
+
+        self.assertFalse(self.plugin.game_state.is_game_active("group"))
+        self.assertEqual(self.runtime.USER_SESSIONS, {})
+        closing = self.plugin._safe_send.call_args.args[1]
+        self.assertIn("Synthetic answer", closing)
+        self.assertIn("满分", closing)
+
+    async def test_reveal_reports_the_best_score_of_the_round(self):
+        game, waiter = await self.start_round()
+
+        await self.verify_with_score(waiter, 41)
+        await self.verify_with_score(waiter, 66)
+        self.assertEqual(game["best_score"], 66)
+
+        await self.runtime.SessionWaiter.trigger(waiter.session_id, self.event("揭晓"))
+        await asyncio.gather(game["_session_task"], return_exceptions=True)
+
+        closing = self.plugin._safe_send.call_args.args[1]
+        self.assertIn("66/100", closing)
+        self.assertIn("未达标", closing)
+
+    async def test_last_attempt_keeps_the_round_open_while_questions_remain(self):
+        game, waiter = await self.start_round()
+        self.plugin.verification_limit = 1
+
+        await self.verify_with_score(waiter, 30)
+
+        # 验证用尽但还能提问，不能替玩家揭晓答案
+        self.assertIs(self.plugin.game_state.get_game("group"), game)
+        self.assertIn("验证次数已用完", self.plugin._send_reply.call_args.args[1])
+
+    async def test_round_ends_when_both_questions_and_attempts_run_out(self):
+        game, waiter = await self.start_round()
+        self.plugin.verification_limit = 1
+        game["question_count"] = game["question_limit"]
+
+        await self.verify_with_score(waiter, 30)
+        await asyncio.gather(game["_session_task"], return_exceptions=True)
+
+        self.assertFalse(self.plugin.game_state.is_game_active("group"))
+        closing = self.plugin._safe_send.call_args.args[1]
+        self.assertIn("Synthetic answer", closing)
+        self.assertIn("30/100", closing)
 
 
 if __name__ == "__main__":
