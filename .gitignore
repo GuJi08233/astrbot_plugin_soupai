@@ -14,3 +14,6 @@ venv/
 
 # 插件运行时数据（应存放于 data/plugin_data/，此处仅作兜底）
 *.log
+
+# 离线评测产物（含谜题原文，不入库）
+tests/eval_results.json
