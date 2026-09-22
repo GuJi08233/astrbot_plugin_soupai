@@ -871,6 +871,65 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.verification_pass_score = 55
         self.assertEqual(self.plugin._pass_score_for({"pass_score": 90}), 55)
 
+    def test_history_labels_every_judgement_source(self):
+        history = [
+            {
+                "question": "有凶手吗",
+                "answer": "否",
+                "judged_by": {"engine": "jev", "confidence": 0.87},
+            },
+            {
+                "question": "洗头是代表什么吗",
+                "answer": "否",
+                "judged_by": {"engine": "llm", "fallback": True},
+            },
+            {
+                "question": "那他也进去了吗",
+                "answer": "是",
+                "judged_by": {"engine": "llm", "routing_reason": "context_required"},
+            },
+            {
+                "question": "他和她都死了吗",
+                "answer": "是也不是",
+                "judged_by": {"engine": "llm", "routing_reason": "compound_question"},
+            },
+            {
+                "question": "纯 LLM 判的",
+                "answer": "是",
+                "judged_by": {"engine": "llm", "fallback": False},
+            },
+            # 本次改动之前的问答没有这个字段，不该渲染出空标签
+            {"question": "旧记录", "answer": "不重要"},
+        ]
+
+        text = self.plugin._format_qa_history(history)
+
+        self.assertIn("[Jev 0.87]", text)
+        self.assertIn("[LLM · Jev 回退]", text)
+        self.assertIn("[LLM · 追问判定]", text)
+        self.assertIn("[LLM · 复合提问]", text)
+        # 旧记录那行到此为止，不留空标签
+        self.assertIn("\n   答：不重要\n", text)
+        self.assertNotIn("[]", text)
+        self.assertTrue(text.rstrip().endswith("Jev 1 · 回退 LLM 1 · LLM 3"))
+        # 判定来源不能夹带任何题目内容
+        self.assertNotIn("汤底", text)
+
+    def test_history_label_handles_missing_or_odd_confidence(self):
+        label = self.plugin._judged_by_label
+        self.assertEqual(label({"engine": "jev"}), "Jev")
+        # bool 是 int 的子类，不能当成置信度格式化
+        self.assertEqual(label({"engine": "jev", "confidence": True}), "Jev")
+        self.assertEqual(label({"engine": "unavailable"}), "判定失败")
+        self.assertEqual(label(None), "")
+        self.assertEqual(label({}), "")
+
+    def test_history_without_any_judgement_data_omits_the_summary(self):
+        text = self.plugin._format_qa_history([{"question": "旧记录", "answer": "是"}])
+
+        self.assertIn("问：旧记录", text)
+        self.assertNotIn("判定来源", text)
+
     def test_invalid_pass_score_config_falls_back_to_difficulty(self):
         for raw in (-1, 101, "abc", None):
             with self.subTest(raw=raw):

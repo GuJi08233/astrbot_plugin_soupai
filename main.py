@@ -2326,8 +2326,8 @@ class SoupaiPlugin(Star):
                             )
                         return
 
-                    # 记录提问和回答。judged_by 只给网页端的对局页看，
-                    # 群里不显示——玩家没必要知道这一问是谁判的
+                    # 记录提问和回答。judged_by 同时供网页对局页和 /查看 使用；
+                    # 单条回答后面不跟标签，那会让每次判定都像在自我辩解
                     if game is not None:
                         history = game.setdefault("qa_history", [])
                         history.append(
@@ -2668,6 +2668,65 @@ class SoupaiPlugin(Star):
             logger.error(f"会话强制结束失败: {e}")
             await event.send(event.plain_result(f"强制结束游戏时发生错误：{e}"))
 
+    @staticmethod
+    def _judged_by_label(judged_by: dict | None) -> str:
+        """这一问是谁判的，措辞与网页对局页的标签保持一致。
+
+        只描述判定来源和它的自评把握，不含任何题目内容。旧问答没有这个字段，
+        返回空串让调用方跳过。
+        """
+        if not isinstance(judged_by, dict) or not judged_by.get("engine"):
+            return ""
+        engine = judged_by["engine"]
+        if engine == "jev":
+            confidence = judged_by.get("confidence")
+            if isinstance(confidence, (int, float)) and not isinstance(
+                confidence, bool
+            ):
+                return f"Jev {confidence:.2f}"
+            return "Jev"
+        if engine == "llm":
+            routing_reason = judged_by.get("routing_reason")
+            if routing_reason == "context_required":
+                return "LLM · 追问判定"
+            if routing_reason == "compound_question":
+                return "LLM · 复合提问"
+            return "LLM · Jev 回退" if judged_by.get("fallback") else "LLM"
+        return "判定失败"
+
+    @classmethod
+    def _judge_summary_text(cls, history: list[dict]) -> str:
+        """整局各判定来源的条数，跟在记录末尾。"""
+        counts = {"Jev": 0, "回退 LLM": 0, "LLM": 0, "判定失败": 0}
+        for item in history:
+            judged_by = item.get("judged_by")
+            if not isinstance(judged_by, dict):
+                continue
+            engine = judged_by.get("engine")
+            if engine == "jev":
+                counts["Jev"] += 1
+            elif engine == "llm":
+                counts["回退 LLM" if judged_by.get("fallback") else "LLM"] += 1
+            elif engine:
+                counts["判定失败"] += 1
+        parts = [f"{name} {n}" for name, n in counts.items() if n]
+        return " · ".join(parts)
+
+    @classmethod
+    def _format_qa_history(cls, history: list[dict]) -> str:
+        """渲染发到群里的提问记录，带每一问的判定来源。"""
+        lines = ["📋 提问记录："]
+        for idx, item in enumerate(history, 1):
+            label = cls._judged_by_label(item.get("judged_by"))
+            suffix = f"　[{label}]" if label else ""
+            lines.append(
+                f"{idx}. 问：{item['question']}\n   答：{item['answer']}{suffix}"
+            )
+        summary = cls._judge_summary_text(history)
+        if summary:
+            lines.append(f"\n🧮 判定来源：{summary}")
+        return "\n".join(lines)
+
     async def _handle_view_history_in_session(
         self, event: AstrMessageEvent, group_id: str
     ):
@@ -2684,12 +2743,7 @@ class SoupaiPlugin(Star):
                 await event.send(event.plain_result("目前还没有人提问哦~"))
                 return
 
-            lines = ["📋 提问记录："]
-            for idx, item in enumerate(history, 1):
-                lines.append(f"{idx}. 问：{item['question']}\n   答：{item['answer']}")
-
-            response = "\n".join(lines)
-            await event.send(event.plain_result(response))
+            await event.send(event.plain_result(self._format_qa_history(history)))
 
         except Exception as e:
             logger.error(f"会话查看历史失败: {e}")
@@ -2893,10 +2947,7 @@ class SoupaiPlugin(Star):
         if not history:
             yield event.plain_result("目前还没有人提问哦~")
             return
-        lines = ["📋 提问记录："]
-        for idx, item in enumerate(history, 1):
-            lines.append(f"{idx}. 问：{item['question']}\n   答：{item['answer']}")
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(self._format_qa_history(history))
 
     # 🆘 强制结束游戏（管理员功能）
     @filter.permission_type(filter.PermissionType.ADMIN)
