@@ -348,7 +348,12 @@ add an automatic full-library annotation task during plugin initialization.
   themselves (`player_id` / `player_name` added to `qa_history` and
   `verify_history`); hints get a parallel `hint_credits` list instead, because
   `hint_history` is a list of plain strings that both hint generation and the
-  web page read in that shape.
+  web page read in that shape. The availability self-check hangs off
+  `on_astrbot_loaded`, never `initialize()`: plugins load one at a time and
+  each one's `initialize()` finishes before the next is even instantiated, so
+  soupai — which sorts before the faucet plugin — would always report a false
+  「不可用」 from there. Do not cache the verdict either; the faucet can be
+  installed or switched on after soupai is already running.
 - **Never put an answer in a list response.** `stories` and `games` return
   puzzles only; `story/answer` is a separate, deliberate request. Annotation
   content is equally spoiler-bearing and belongs only in explicit detail

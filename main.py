@@ -2884,6 +2884,10 @@ class SoupaiPlugin(Star):
         best = int(game.get("best_score") or 0)
         if best:
             lines.append(f"🏆 当前最高得分：{best}/100")
+        # 关着就一个字都不提，没用这功能的群不该看见多余的行；开着才显示，
+        # 顺带把「开了但发币插件不在」这种配错当场暴露出来
+        if self.reward_enabled:
+            lines.append(f"🪙 奖励：{self._reward_status()}")
         return "\n".join(lines)
 
     # difficulty_settings 允许被改写（测试和二次开发都这么干），所以查不到
@@ -3043,22 +3047,52 @@ class SoupaiPlugin(Star):
         shares[0]["amount"] += max(0, self.reward_pool - handed)
         return [item for item in shares if item["amount"] > 0]
 
-    def _faucet_grant(self):
+    def _faucet_grant(self, quiet: bool = False):
         """取发币插件的 grant 方法，取不到返回 None。
 
         海龟汤不依赖发币插件：它没装、没启用、或者改了接口，这一局照样正常
         玩完，只是不发币。绝不让发奖挡住对局收尾。
+
+        Args:
+            quiet: 只查可用性时传 True，免得状态查询把告警刷进日志。
         """
         try:
             star = self.context.get_registered_star(self.reward_plugin)
         except Exception as exc:
-            logger.warning(f"查找发币插件失败: {exc}")
+            if not quiet:
+                logger.warning(f"查找发币插件失败: {exc}")
             return None
         grant = getattr(getattr(star, "star_cls", None), "grant", None)
         if not callable(grant):
-            logger.warning(f"发币插件 {self.reward_plugin} 不可用，本局不发奖励")
+            if not quiet:
+                logger.warning(f"发币插件 {self.reward_plugin} 不可用，本局不发奖励")
             return None
         return grant
+
+    def _reward_status(self) -> str:
+        """奖励此刻能不能用，一句话说清，供启动自检和 /汤状态 共用。
+
+        每次现查而不缓存：发币插件可能在海龟汤之后才装上或被启用，缓存下来
+        的结论会一直错下去。
+        """
+        if not self.reward_enabled:
+            return "未启用"
+        if self._faucet_grant(quiet=True) is None:
+            return f"已启用，但未找到发币插件 {self.reward_plugin}，对局结束不会发奖"
+        cap = f"{self.reward_daily_cap}/人/天" if self.reward_daily_cap else "不限"
+        return f"已启用，每局奖池 {self.reward_pool}，日上限 {cap}"
+
+    @filter.on_astrbot_loaded()
+    async def _report_reward_status(self):
+        """AstrBot 全部加载完之后自检一次发奖链路。
+
+        不能放进 initialize()：插件是逐个加载的，每个插件的 initialize() 在
+        下一个插件实例化之前就跑完了，而海龟汤按字母序排在发币插件前面——
+        那时候查必然查不到，只会报出一句假的「不可用」。这个钩子在
+        core_lifecycle.start() 里触发，那时所有插件都已就位。
+        """
+        if self.reward_enabled:
+            logger.info(f"海龟汤对局奖励：{self._reward_status()}")
 
     def _settle_rewards(self, group_id: str, game: dict, ending: str) -> None:
         """算出这一局的奖励分配，并把发放排进后台。

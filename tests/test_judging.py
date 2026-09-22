@@ -36,6 +36,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
                     command=decorate,
                     permission_type=decorate,
                     event_message_type=decorate,
+                    on_astrbot_loaded=decorate,
                     PermissionType=SimpleNamespace(ADMIN="admin"),
                     EventMessageType=SimpleNamespace(ALL="all"),
                 ),

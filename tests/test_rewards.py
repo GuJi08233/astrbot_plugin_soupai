@@ -275,6 +275,70 @@ class RewardSettlementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.plugin._contribution_question())
 
     # ---------------------------------------------------------------- #
+    # Standing on its own
+    # ---------------------------------------------------------------- #
+
+    def test_status_is_silent_while_rewards_are_off(self):
+        self.plugin.reward_enabled = False
+
+        self.assertEqual(self.plugin._reward_status(), "未启用")
+
+    def test_status_names_the_plugin_it_could_not_find(self):
+        """配错了要当场说清是哪个名字没找到，不能只说一句用不了。"""
+        self.plugin.context = SimpleNamespace(
+            get_registered_star=Mock(return_value=None)
+        )
+        status = self.plugin._reward_status()
+
+        self.assertIn("astrbot_plugin_token_faucet", status)
+        self.assertIn("不会发奖", status)
+
+    def test_status_reports_the_pool_once_the_faucet_answers(self):
+        self.faucet()
+        status = self.plugin._reward_status()
+
+        self.assertIn("20", status)
+        self.assertIn("100", status)
+
+    def test_availability_is_rechecked_every_time(self):
+        """发币插件可能在海龟汤之后才装上，缓存下来的结论会一直错下去。"""
+        star = SimpleNamespace(star_cls=None)
+        self.plugin.context = SimpleNamespace(
+            get_registered_star=Mock(return_value=star)
+        )
+        self.assertIn("不会发奖", self.plugin._reward_status())
+
+        star.star_cls = SimpleNamespace(grant=AsyncMock(return_value=1))
+        self.assertNotIn("不会发奖", self.plugin._reward_status())
+
+    def test_probing_availability_keeps_quiet(self):
+        """状态查询不该把告警刷进日志——/汤状态 可能被按很多次。"""
+        self.plugin.context = SimpleNamespace(
+            get_registered_star=Mock(return_value=None)
+        )
+        with self.assertNoLogs("soupai.tests", level="WARNING"):
+            self.assertIsNone(self.plugin._faucet_grant(quiet=True))
+
+    def test_game_status_mentions_rewards_only_when_enabled(self):
+        self.faucet()
+        self.plugin.difficulty_settings = {
+            "普通": {"limit": 35, "pass_score": 70, "hint_limit": 5}
+        }
+        game = {
+            "puzzle": "Synthetic puzzle",
+            "difficulty": "普通",
+            "question_count": 1,
+            "question_limit": 35,
+            "hint_count": 0,
+            "hint_limit": 5,
+        }
+
+        self.assertIn("🪙 奖励", self.plugin._format_game_status(game))
+
+        self.plugin.reward_enabled = False
+        self.assertNotIn("🪙", self.plugin._format_game_status(game))
+
+    # ---------------------------------------------------------------- #
     # Handing the tokens over
     # ---------------------------------------------------------------- #
 
