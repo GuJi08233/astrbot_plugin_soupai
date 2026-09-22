@@ -937,6 +937,90 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
                 self.plugin._load_config()
                 self.assertEqual(self.plugin.verification_pass_score, 0)
 
+    def test_allow_list_yields_words_not_whole_sentences(self):
+        allow = self.plugin.build_allow_list(
+            "晚上，我在寝室洗了个头，结果室友和我都死了。",
+            [
+                {"question": "有凶手吗", "answer": "否"},
+                {"question": "室友先死的吗", "answer": "是"},
+            ],
+        )
+
+        # 早期实现按标点切分，整句进表，等于没有约束
+        self.assertNotIn("我在寝室洗了个头", allow)
+        self.assertNotIn("结果室友和我都死了", allow)
+        # 问句和回答分开提取，不能粘成「有凶手吗否」
+        self.assertNotIn("有凶手吗否", allow)
+        for word in ("晚上", "寝室", "室友", "凶手"):
+            self.assertIn(word, allow)
+        # 判定词本身不是题面里的说法
+        for verdict in ("是", "否", "不重要", "是也不是"):
+            self.assertNotIn(verdict, allow)
+        self.assertEqual(len(allow), len(set(allow)))
+        self.assertTrue(all(1 <= len(token) <= 3 for token in allow))
+
+    def test_allow_list_drops_fragments_split_across_words(self):
+        allow = self.plugin.build_allow_list("结果室友和我都死了。", [])
+
+        # 首尾是虚词的片段是滑窗跨过词边界切出来的
+        for noise in ("友和", "和我", "我都", "都死"):
+            self.assertNotIn(noise, allow)
+        self.assertIn("室友", allow)
+        # 跨句重复的片段排在前面
+        repeated = self.plugin.build_allow_list(
+            "室友在寝室。", [{"question": "室友先死的吗", "answer": "是"}]
+        )
+        self.assertEqual(repeated[0], "室友")
+
+    def test_allow_list_is_bounded(self):
+        allow = self.plugin.build_allow_list("字" * 400, [])
+
+        self.assertLessEqual(len(allow), self.plugin._ALLOW_LIST_LIMIT)
+
+    def test_recent_progress_flags_a_dead_end(self):
+        describe = self.plugin._describe_recent_progress
+
+        self.assertEqual(describe([]), "（暂无）")
+        # 一两问看不出走没走偏，不下结论
+        self.assertNotIn("走不通", describe([{"question": "q", "answer": "否"}] * 2))
+        stuck = describe([{"question": "q", "answer": "否"}] * 4)
+        self.assertIn("走不通", stuck)
+        self.assertIn("4 问中有 4 问", stuck)
+        rolling = describe([{"question": "q", "answer": "是"}] * 3)
+        self.assertIn("方向大体正确", rolling)
+        # 只看最近 6 问，更早的不拖累判断
+        recovered = describe(
+            [{"question": "q", "answer": "否"}] * 10
+            + [{"question": "q", "answer": "是"}] * 6
+        )
+        self.assertIn("方向大体正确", recovered)
+        # 判定失败这类非标准回答不计入
+        self.assertEqual(
+            describe([{"question": "q", "answer": "判定服务暂时不可用"}]), "（暂无）"
+        )
+
+    async def test_hint_prompt_carries_history_and_progress(self):
+        await self.plugin.generate_hint(
+            "Synthetic puzzle",
+            "Synthetic answer",
+            [
+                {"question": "有凶手吗", "answer": "否"},
+                {"question": "是意外吗", "answer": "否"},
+                {"question": "和天气有关吗", "answer": "不重要"},
+            ],
+            ["关注【时间】：比较先后"],
+            ["凶手", "意外"],
+            umo="test-session",
+        )
+
+        prompt = self.hint_provider.text_chat.await_args.kwargs["prompt"]
+        self.assertIn("有凶手吗", prompt)
+        self.assertIn("关注【时间】：比较先后", prompt)
+        self.assertIn("走不通的线上", prompt)
+        self.assertIn("Synthetic answer", prompt)
+        # 力度约束必须留在提示词里，否则模型会直接把谜底缩写给玩家
+        self.assertIn("不是答案的缩写", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

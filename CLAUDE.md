@@ -279,6 +279,19 @@ add an automatic full-library annotation task during plugin initialization.
   round's difficulty, then 普通. Per-dimension scores stay out of chat —
   telling a player the 反转 line scored 20 tells them there is a twist they
   have not found.
+- **Hints steer by how the player is doing, and `allow_list` is word-level.**
+  `_describe_recent_progress()` computes the progress line in code — the model
+  is bad at counting verdicts out of a transcript. Six or more tenths of the
+  last six answers being 否/不重要 means the player is down a dead end and the
+  hint should move attention off that line; a round still inside
+  `_HINT_EARLY_GAME_TURNS` questions only names which kind of thing to ask
+  about, because a player who has not gone wrong yet needs no correction.
+  `build_allow_list()` returns 2-3 character windows, not sentences: an earlier
+  version split on punctuation and fed whole clauses back in (and glued
+  questions to answers, yielding 「有凶手吗否」), which made "only use listed
+  words" unenforceable. Keep the leading/trailing-particle filter — without it
+  the table fills with cross-boundary junk like 「友和」 and crowds out real
+  nouns. None of this guarantees no leak; it is the main mitigation.
 - **Never echo the verification LLM's critique while the round is still open.**
   To explain the mistake it retells the answer. Use the `_SCORE_BANDS` feedback
   instead, and print `result.comment` only on a message that ends the round.

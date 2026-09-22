@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -1851,30 +1852,97 @@ class SoupaiPlugin(Star):
             return "（判断失败，请重试）", unavailable
 
     # ✅ 生成方向性提示
-    def build_allow_list(self, puzzle: str, qa_history: list[dict]) -> list[str]:
-        """根据题面和历史问答构建允许在提示中出现的名词列表"""
-        import re
+    # 判定回答本身不是题面里的说法，混进词表只会让提示复述「否」「不重要」
+    _VERDICT_WORDS = frozenset({"是", "否", "不重要", "是也不是"})
+    # 全由虚词拼成的片段没有指示作用，留着只会挤掉真正的名词
+    _HINT_FILLER_CHARS = frozenset("的了吗呢吧啊是否有在和与或不没这那个们就都还很")
+    _ALLOW_LIST_LIMIT = 80
+    # 提问数不超过这个值时算开局，提示要更克制
+    _HINT_EARLY_GAME_TURNS = 3
 
-        # 汇总文本：题面 + 所有问答
-        parts = [puzzle] + [
-            f"{item.get('question', '')}{item.get('answer', '')}" for item in qa_history
-        ]
-        text = "\n".join(parts)
+    @classmethod
+    def build_allow_list(cls, puzzle: str, qa_history: list[dict]) -> list[str]:
+        """题面和历史问答里出现过的说法，供提示挑词。
 
-        # 提取连续的中文、字母或数字片段作为候选名词
-        tokens = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text)
+        中文没有词边界，这里按标点切句后取 2-3 字滑窗，拿到的是候选词面而不是
+        严格的词。宁可混进几个无意义片段，也不能像早期实现那样把整句塞进去：
+        那样「只用表内词」这条约束形同虚设，模型要么无视它，要么整句照搬。
+        问句和回答分开提取，否则会粘出「有凶手吗否」这种假词。
+        """
+        segments: list[str] = []
+        for text in [puzzle] + [
+            part
+            for item in qa_history
+            for part in (item.get("question", ""), item.get("answer", ""))
+        ]:
+            if text:
+                segments.extend(re.findall(r"[A-Za-z0-9一-鿿]+", text))
 
-        allow: list[str] = []
-        for token in tokens:
-            if not token:
+        counts: Counter[str] = Counter()
+        order: dict[str, int] = {}
+
+        def add(token: str) -> None:
+            if token in cls._VERDICT_WORDS:
+                return
+            counts[token] += 1
+            order.setdefault(token, len(order))
+
+        for segment in segments:
+            if segment in cls._VERDICT_WORDS:
                 continue
-            # 同义合并：例如“男人A”“嫌疑人A”只保留末尾的大写字母
-            m = re.match(r".*([A-Z])$", token)
-            if m:
-                token = m.group(1)
-            if token not in allow:
-                allow.append(token)
-        return allow
+            if segment.isascii():
+                # 英文和数字自带边界，整体就是一个词
+                add(segment)
+                continue
+            if len(segment) < 2:
+                add(segment)
+                continue
+            for size in (2, 3):
+                for start in range(len(segment) - size + 1):
+                    piece = segment[start : start + size]
+                    # 首尾是虚词的多半是跨词边界切出来的，例如「友和」「我都」
+                    if (
+                        piece[0] in cls._HINT_FILLER_CHARS
+                        or piece[-1] in cls._HINT_FILLER_CHARS
+                    ):
+                        continue
+                    add(piece)
+
+        # 跨句重复出现的片段更可能是真词；同频时保持首次出现的顺序，
+        # 这样题面里的说法排在后来问答之前。
+        ranked = sorted(order, key=lambda token: (-counts[token], order[token]))
+        return ranked[: cls._ALLOW_LIST_LIMIT]
+
+    @classmethod
+    def _describe_recent_progress(cls, qa_history: list[dict]) -> str:
+        """玩家走到哪一步了，用来决定提示该推进还是该纠偏。
+
+        让模型自己从问答里数容易数错，这里直接给结论。只统计提问数量和判定
+        结果，不含任何题目内容，所以不会额外泄露东西。
+        """
+        recent = [
+            item.get("answer", "")
+            for item in qa_history[-6:]
+            if item.get("answer") in cls._VERDICT_WORDS
+        ]
+        if not recent:
+            return "（暂无）"
+        total = len([item for item in qa_history if item.get("answer")])
+        stage = (
+            f"本局才问了 {total} 次，仍处于开局阶段"
+            if total <= cls._HINT_EARLY_GAME_TURNS
+            else f"本局已提问 {total} 次"
+        )
+        misses = sum(1 for answer in recent if answer in ("否", "不重要"))
+        summary = (
+            f"{stage}；最近 {len(recent)} 问中有 {misses} 问被判为「否」或「不重要」"
+        )
+        # 按比例判断，否则 6 问 4 否这种明显的死胡同会被漏掉
+        if len(recent) >= 3 and misses / len(recent) >= 0.6:
+            return f"{summary}，玩家很可能卡在一条走不通的线上"
+        if misses == 0:
+            return f"{summary}，玩家方向大体正确，正在推进"
+        return summary
 
     async def generate_hint(
         self,
@@ -1898,22 +1966,42 @@ class SoupaiPlugin(Star):
         )
         hint_text = "\n".join(hint_history) if hint_history else "（无）"
         allow_text = ", ".join(allow_list) if allow_list else "（无）"
+        progress_text = self._describe_recent_progress(qa_history)
         prompt = (
             '你是"海龟汤"提示生成器。你知道完整真相（仅供内部推理，严禁外泄）。\n'
             "材料：\n\n"
             f"* 题面：{puzzle}\n"
             f"* 完整真相（不可外泄）：{true_answer}\n"
             f"* 历史问答：{history_text}\n"
+            f"* 最近进展：{progress_text}\n"
             f"* 历史提示：{hint_text}\n"
-            f"* 允许名词 allow_list：{allow_text}（只能使用其中名词，不得创造新名词）\n\n"
+            f"* 本局已出现的说法：{allow_text}\n"
+            "  （优先从中取词；可用通用词，但不得引入题面和历史问答里\n"
+            "  从未出现过的具体名词）\n\n"
             "在心中完成：\n\n"
-            "1. 从历史问答归纳：已确认/已否定/不重要/部分正确的信息；\n"
-            "2. 用以下维度整理：对象/身份、关系、动机、时间、地点、证据、步骤、先后、条件、规则、误解；\n"
-            "3. 选择一个“未探索”或“partial 尚缺”的维度，且与历史提示不重复；\n"
-            "4. 只使用 allow_list 中的名词与通用词，生成一句**动作化**的下一步提问方向；\n"
-            "5. 禁止泄露真相细节，不得同义改写泄露；不得复述已确认内容。\n\n"
+            "1. 从历史问答归纳四类信息：已确认为真、已被否定、判为不重要、部分正确；\n"
+            "2. 判断玩家当前走在哪条线上，并据此决定这次提示做什么：\n"
+            "   * 若玩家最近反复在已被否定或已判为不重要的方向上追问，"
+            "把注意力移开那条线，指向一个尚未触及、且确实通往真相的维度；\n"
+            "   * 若玩家方向大体正确但停在半路，就沿这条线向前推一步；\n"
+            "   * 若玩家还没形成方向，选最能打开局面的那个维度；\n"
+            "3. 维度只能从这份清单里挑，不要自造：对象/身份、关系、动机、时间、"
+            "地点、证据、步骤、先后、条件、规则、误解；\n"
+            "4. 所选维度不得与历史提示重复；\n"
+            "5. 只指出该往哪里问，不给结论：不得直接或间接说出真相，\n"
+            "   不得确认或否定玩家的任何具体猜测（那是 /验证 的事），\n"
+            "   不得复述已确认内容，不得同义改写泄露。\n\n"
+            "拿捏力度：这是一句把玩家推回正轨的提问方向，不是答案的缩写。\n"
+            "玩家读完应该知道下一个问题往哪个方向问，但仍然需要自己问出来。\n"
+            "宁可略保守，也不要让玩家看完就直接会了。具体地说：\n"
+            "* 若「最近进展」显示仍处于开局阶段，只指出该问哪一类事情，\n"
+            "  不要把注意力直接引到谜底所在的那个点上——玩家还没走冤枉路，\n"
+            "  不需要纠偏；\n"
+            "* 只有在「最近进展」明确说玩家卡在走不通的线上时，才给出足以\n"
+            "  让他换条线的方向；即便如此也只说往哪看，不说看到的会是什么；\n"
+            "* 任何时候都不要写出真相里的关键机制或物件，哪怕换个说法。\n\n"
             "输出要求（只输出一句）：\n\n"
-            "* 格式：关注【<维度>】：<动词 + allow_list名词/通用词>\n"
+            "* 格式：关注【<维度>】：<动词 + 名词/通用词>\n"
             "* 字数 ≤ 22（或 ≤ 24），不得添加解释。"
         )
 
