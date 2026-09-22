@@ -80,6 +80,14 @@ class SoupaiWebApi:
             ("/usage/reset", self.usage_reset, ["POST"], "重置使用记录"),
             ("/games", self.games, ["GET"], "进行中的对局"),
             ("/games/end", self.games_end, ["POST"], "强制结束某局"),
+            ("/history", self.history, ["GET"], "结束对局的存档（不含汤底）"),
+            (
+                "/history/detail",
+                self.history_detail,
+                ["GET"],
+                "单局复盘（含汤底）",
+            ),
+            ("/history/clear", self.history_clear, ["POST"], "清理对局存档"),
             ("/config", self.config_get, ["GET"], "插件配置（含服务商下拉项）"),
             ("/config/save", self.config_save, ["POST"], "保存插件配置"),
         ]
@@ -625,13 +633,59 @@ class SoupaiWebApi:
         if not key:
             return error_response("需要指定对局")
         game = self.plugin.game_state.get_game(key)
-        ended = self.plugin.game_state.end_game(key)
+        ended = self.plugin.game_state.end_game(key, "web_end")
         task = game.get("_session_task") if game else None
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         if ended:
             logger.info(f"网页端强制结束对局 {key} by {request.username}")
         return _ok({"ended": ended})
+
+    async def history(self):
+        """结束对局的存档列表。和题库列表一样，这里不带汤底。"""
+        archive = getattr(self.plugin, "game_archive", None)
+        if archive is None:
+            return _ok({"total": 0, "games": [], "sessions": [], "offset": 0})
+        session = (request.query.get("session") or "").strip()
+        try:
+            limit = min(max(int(request.query.get("limit") or 20), 1), 100)
+            offset = max(int(request.query.get("offset") or 0), 0)
+        except ValueError:
+            return error_response("分页参数不合法")
+        payload = archive.page(session=session, limit=limit, offset=offset)
+        payload["sessions"] = [
+            {**item, "label": self._session_label(item["session"])}
+            for item in archive.sessions()
+        ]
+        for game in payload["games"]:
+            game["label"] = self._session_label(game.get("session") or "")
+        return _ok(payload)
+
+    async def history_detail(self):
+        """整局复盘，含汤底：这一局已经结束，对照真相才看得懂判定。"""
+        archive = getattr(self.plugin, "game_archive", None)
+        entry_id = (request.query.get("id") or "").strip()
+        if archive is None or not entry_id:
+            return error_response("需要指定存档 id")
+        entry = archive.detail(entry_id)
+        if entry is None:
+            return error_response("找不到这局存档，可能已被新的对局挤出")
+        entry["label"] = self._session_label(entry.get("session") or "")
+        return _ok(entry)
+
+    async def history_clear(self):
+        """清空存档，或只清某个会话。"""
+        archive = getattr(self.plugin, "game_archive", None)
+        if archive is None:
+            return error_response("存档不可用")
+        data = await self._payload()
+        session = (data.get("session") or "").strip()
+        removed = archive.clear(session)
+        logger.info(
+            f"网页端清理对局存档 session={session or 'all'} 共 {removed} 局 "
+            f"by {request.username}"
+        )
+        return _ok({"removed": removed})
 
     # ------------------------------------------------------------ 配置
 

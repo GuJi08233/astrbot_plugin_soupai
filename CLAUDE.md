@@ -316,6 +316,15 @@ add an automatic full-library annotation task during plugin initialization.
   DM works through the bank independently. Games are still keyed by `group_id`,
   so each game carries a `session` field to tie the two together — keep writing
   it in `start_game`, the web UI relies on it.
+- **Archive finished rounds through `GameState`'s `on_end` hook, not at the
+  call sites.** A round has more than a dozen exits (reveal, timeout, perfect
+  score, exhausted attempts, force end, web end, unload, several error paths);
+  hooking each one guarantees a miss. `end_game(group_id, ending)` carries how
+  it finished, and the hook swallows its own failures — a broken archive must
+  never leave a round stuck "active", because then that group can never start
+  another. `_RUNTIME_KEYS` keeps `_session_task` (not serialisable) and
+  `_player_qa` out of the file. Rounds with no questions, hints or
+  verifications are not worth archiving.
 - **Never put an answer in a list response.** `stories` and `games` return
   puzzles only; `story/answer` is a separate, deliberate request. Annotation
   content is equally spoiler-bearing and belongs only in explicit detail

@@ -305,6 +305,120 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["created"], [])
         self.assertEqual(result["data"]["failed"], ["Invalid generated output"])
 
+    def _archive_with_one_round(self):
+        """挂一个真的 GameArchive，跑完一局再交给接口。
+
+        复用 test_archive 的模块加载：main.py 里有相对导入，需要那套
+        包名桩才 import 得起来。
+        """
+        import tempfile
+
+        import test_archive
+
+        test_archive.ArchiveTests.setUpClass()
+        main = test_archive.ArchiveTests.module
+
+        archive = main.GameArchive(Path(tempfile.mkdtemp()))
+        state = main.GameState(
+            on_end=lambda gid, game, ending: archive.append(gid, game, ending)
+        )
+        state.start_game(
+            "group-1",
+            "Synthetic puzzle",
+            "Synthetic answer",
+            session="test:GroupMessage:g1",
+            difficulty="普通",
+            pass_score=70,
+            best_score=86,
+            passed=True,
+            question_count=1,
+            question_limit=35,
+            hint_count=1,
+            hint_limit=5,
+            verification_attempts=1,
+            started_at="2026-09-22T20:00:00",
+        )
+        game = state.get_game("group-1")
+        game["qa_history"] = [
+            {
+                "question": "有凶手吗",
+                "answer": "否",
+                "judged_by": {"engine": "jev", "confidence": 0.87},
+            }
+        ]
+        game["hint_history"] = ["关注【条件】：询问环境情况"]
+        game["verify_history"] = [
+            {
+                "guess": "Synthetic guess",
+                "score": 86,
+                "breakdown": {"facts": 90, "motive": 80, "twist": 88},
+                "level": "核心推理正确",
+                "pass_score": 70,
+                "passed": True,
+                "charged": False,
+            }
+        ]
+        state.end_game("group-1", "reveal")
+        self.plugin.game_archive = archive
+        self.plugin.game_state = state
+        return archive
+
+    async def test_history_list_hides_answers_and_labels_sessions(self):
+        self._archive_with_one_round()
+
+        payload = (await self.api.history())["data"]
+
+        (row,) = payload["games"]
+        self.assertNotIn("answer", row)
+        self.assertEqual(row["ending"], "reveal")
+        self.assertEqual(row["best_score"], 86)
+        self.assertTrue(row["label"])
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(
+            [item["session"] for item in payload["sessions"]],
+            ["test:GroupMessage:g1"],
+        )
+
+    async def test_history_detail_carries_the_answer_and_full_replay(self):
+        archive = self._archive_with_one_round()
+        entry_id = archive.entries[0]["id"]
+        self.request.query = {"id": entry_id}
+
+        detail = (await self.api.history_detail())["data"]
+
+        self.assertEqual(detail["answer"], "Synthetic answer")
+        self.assertEqual(len(detail["qa_history"]), 1)
+        self.assertEqual(detail["hint_history"], ["关注【条件】：询问环境情况"])
+        self.assertEqual(detail["verify_history"][0]["breakdown"]["twist"], 88)
+        # 判定来源要一起留着，否则复盘看不出这一问是谁判的
+        self.assertEqual(detail["qa_history"][0]["judged_by"]["engine"], "jev")
+
+    async def test_history_detail_rejects_an_unknown_id(self):
+        self._archive_with_one_round()
+        self.request.query = {"id": "no-such-id"}
+
+        self.assertEqual((await self.api.history_detail())["status"], "error")
+
+        self.request.query = {}
+        self.assertEqual((await self.api.history_detail())["status"], "error")
+
+    async def test_history_clear_can_be_scoped_to_one_session(self):
+        archive = self._archive_with_one_round()
+        self.request.json.return_value = {"session": "nope"}
+
+        self.assertEqual((await self.api.history_clear())["data"]["removed"], 0)
+
+        self.request.json.return_value = {}
+        self.assertEqual((await self.api.history_clear())["data"]["removed"], 1)
+        self.assertEqual(archive.entries, [])
+
+    async def test_history_endpoints_survive_a_missing_archive(self):
+        self.plugin.game_archive = None
+
+        self.assertEqual((await self.api.history())["data"]["games"], [])
+        self.assertEqual((await self.api.history_detail())["status"], "error")
+        self.assertEqual((await self.api.history_clear())["status"], "error")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -249,10 +249,151 @@ class ThreadSafeStoryStorage:
             return story["puzzle"], story["answer"]
 
 
+class GameArchive:
+    """结束的对局存档，供网页复盘。
+
+    汤底只在详情里返回，列表不带——和题库页一个约定。存档只增不改，超出
+    上限时丢最旧的一局。归档失败绝不能影响对局结束，调用方负责吞异常。
+    """
+
+    _MAX_ENTRIES = 200
+    # 运行时字段，不进存档：task 不可序列化，_player_qa 是判定用的中间态
+    _RUNTIME_KEYS = ("_session_task", "_player_qa", "is_active", "answer")
+
+    def __init__(self, data_path=None):
+        self.data_path = data_path
+        self.archive_file = data_path / "game_history.json" if data_path else None
+        self._lock = threading.RLock()
+        self.entries: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.archive_file or not self.archive_file.exists():
+            return
+        try:
+            with self.archive_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.entries = [item for item in data if isinstance(item, dict)]
+        except (OSError, ValueError) as exc:
+            # 存档坏了不该让插件起不来，复盘数据没有那么重要
+            logger.warning(f"Could not read the game archive: {exc}")
+            self.entries = []
+
+    def _persist(self) -> None:
+        if not self.archive_file:
+            return
+        temporary = self.archive_file.with_name(
+            f".{self.archive_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            self.archive_file.parent.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8") as f:
+                json.dump(self.entries, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temporary.replace(self.archive_file)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Could not clean up archive temporary file: {exc}")
+
+    def append(self, group_id: str, game: dict, ending: str) -> dict | None:
+        """归档一局。返回写入的条目，没什么可存时返回 None。"""
+        if not isinstance(game, dict) or not game.get("puzzle"):
+            return None
+        if not any(
+            game.get(key) for key in ("qa_history", "hint_history", "verify_history")
+        ):
+            # 出题就失败、或开局即被强制结束的空局，复盘没有价值
+            return None
+        entry = {
+            key: value
+            for key, value in game.items()
+            if key not in self._RUNTIME_KEYS and not key.startswith("_")
+        }
+        entry["id"] = uuid.uuid4().hex[:12]
+        entry["group_id"] = group_id
+        entry["ending"] = ending
+        entry["ended_at"] = datetime.now().isoformat()
+        # 汤底单独放，方便列表接口整体剔除
+        entry["answer"] = game.get("answer", "")
+        with self._lock:
+            self.entries.append(entry)
+            if len(self.entries) > self._MAX_ENTRIES:
+                del self.entries[: len(self.entries) - self._MAX_ENTRIES]
+            try:
+                self._persist()
+            except (OSError, ValueError, TypeError) as exc:
+                logger.error(f"Could not persist the game archive: {exc}")
+        return entry
+
+    def page(self, session: str = "", limit: int = 20, offset: int = 0) -> dict:
+        """倒序分页，条目不含汤底。"""
+        with self._lock:
+            rows = [
+                item
+                for item in reversed(self.entries)
+                if not session or item.get("session") == session
+            ]
+            total = len(rows)
+            page = rows[offset : offset + limit]
+            return {
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "games": [
+                    {key: value for key, value in item.items() if key != "answer"}
+                    for item in page
+                ],
+            }
+
+    def detail(self, entry_id: str) -> dict | None:
+        """整局记录，含汤底：这一局已经结束，复盘需要对照真相。"""
+        with self._lock:
+            for item in self.entries:
+                if item.get("id") == entry_id:
+                    return dict(item)
+        return None
+
+    def sessions(self) -> list[dict]:
+        """存档里出现过的会话及其局数，供筛选下拉用。"""
+        counts: Counter[str] = Counter()
+        with self._lock:
+            for item in self.entries:
+                counts[str(item.get("session") or "")] += 1
+        return [
+            {"session": session, "count": count}
+            for session, count in counts.most_common()
+            if session
+        ]
+
+    def clear(self, session: str = "") -> int:
+        """清空存档，或只清某个会话。返回删掉的局数。"""
+        with self._lock:
+            before = len(self.entries)
+            if session:
+                self.entries = [
+                    item for item in self.entries if item.get("session") != session
+                ]
+            else:
+                self.entries = []
+            removed = before - len(self.entries)
+            if removed:
+                try:
+                    self._persist()
+                except (OSError, ValueError, TypeError) as exc:
+                    logger.error(f"Could not persist the game archive: {exc}")
+            return removed
+
+
 # 游戏状态管理
 class GameState:
-    def __init__(self):
+    def __init__(self, on_end=None):
         self.active_games: dict[str, dict] = {}  # 群聊ID -> 游戏状态
+        # 对局有十几个结束出口，归档挂在这里而不是逐个调用点，免得漏掉一个
+        self._on_end = on_end
 
     def start_game(self, group_id: str, puzzle: str, answer: str, **extra) -> bool:
         """开始游戏，返回是否成功"""
@@ -264,16 +405,18 @@ class GameState:
             "is_active": True,
             "qa_history": [],
             "hint_history": [],
+            "verify_history": [],
         }
         game_data.update(extra)
         self.active_games[group_id] = game_data
         return True
 
-    def end_game(self, group_id: str) -> bool:
+    def end_game(self, group_id: str, ending: str = "unknown") -> bool:
         """End a round and cancel its message waiter.
 
         Args:
             group_id: Group whose round should end.
+            ending: How the round finished, recorded in the archive.
 
         Returns:
             Whether an active round was removed.
@@ -289,6 +432,11 @@ class GameState:
             current_task = None
         if task is not None and task is not current_task and not task.done():
             task.cancel()
+        if self._on_end is not None:
+            try:
+                self._on_end(group_id, game, ending)
+            except Exception as exc:  # noqa: BLE001 - 存档坏了也得让这局结束
+                logger.warning(f"Could not archive the finished round: {exc}")
         return True
 
     def get_game(self, group_id: str) -> dict | None:
@@ -657,7 +805,7 @@ class SoupaiPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.game_state = GameState()
+        self.game_state = GameState(on_end=self._archive_finished_round)
 
         # Jev 的 httpx 客户端，首次判定时惰性创建
         self._jev_client: httpx.AsyncClient | None = None
@@ -692,6 +840,9 @@ class SoupaiPlugin(Star):
         # 数据存储路径: 使用框架提供的工具获取插件数据目录
         self.data_path = StarTools.get_data_dir()
         self.data_path.mkdir(parents=True, exist_ok=True)
+
+        # 结束对局的存档，供网页复盘
+        self.game_archive = GameArchive(self.data_path)
 
         # 存储库初始化延迟到 init 方法中
         self.local_story_storage = None
@@ -864,7 +1015,7 @@ class SoupaiPlugin(Star):
             task = game.get("_session_task")
             if task is not None:
                 session_tasks.append(task)
-            self.game_state.end_game(group_id)
+            self.game_state.end_game(group_id, "unload")
         if session_tasks:
             await asyncio.gather(*session_tasks, return_exceptions=True)
         # 停止自动生成
@@ -2224,7 +2375,7 @@ class SoupaiPlugin(Star):
             if generating:
                 self.generating_games.discard(group_id)
             if game is not None and self.game_state.get_game(group_id) is game:
-                self.game_state.end_game(group_id)
+                self.game_state.end_game(group_id, "aborted")
 
     # 🔍 揭晓指令
     @filter.command("揭晓")
@@ -2259,7 +2410,7 @@ class SoupaiPlugin(Star):
         )
 
         # 结束游戏
-        self.game_state.end_game(group_id)
+        self.game_state.end_game(group_id, "reveal")
         logger.info(f"游戏已结束，群ID: {group_id}")
 
     # 🎯 游戏会话控制
@@ -2362,7 +2513,7 @@ class SoupaiPlugin(Star):
                             answer = game["answer"]
                             puzzle = game["puzzle"]
                             best_line = self._best_score_text(game)
-                            self.game_state.end_game(group_id)
+                            self.game_state.end_game(group_id, "reveal")
                             await self._safe_send(
                                 event,
                                 f"🎯 海龟汤游戏结束！\n\n📖 题面：{puzzle}\n"
@@ -2470,7 +2621,7 @@ class SoupaiPlugin(Star):
                         return
                     logger.error(f"会话控制内部错误: {e}")
                     # 先结束游戏再发消息，确保发送失败也不会残留状态
-                    self.game_state.end_game(group_id)
+                    self.game_state.end_game(group_id, "error")
                     controller.stop()
                     await self._safe_send(event, f"游戏处理过程中发生错误：{e}")
 
@@ -2494,7 +2645,7 @@ class SoupaiPlugin(Star):
                     best_line = self._best_score_text(game)
                     # 先清状态再发消息：平台掉线时 send 会抛异常，
                     # 若先发后清，本局将永久卡在「进行中」而无法重开
-                    self.game_state.end_game(group_id)
+                    self.game_state.end_game(group_id, "timeout")
                     await self._safe_send(
                         event,
                         f"⏰ 游戏超时！\n\n📖 完整故事：{true_answer}"
@@ -2504,19 +2655,19 @@ class SoupaiPlugin(Star):
                 if self.game_state.get_game(group_id) is not session_game:
                     return
                 logger.error(f"游戏会话错误: {e}")
-                self.game_state.end_game(group_id)
+                self.game_state.end_game(group_id, "error")
                 await self._safe_send(event, f"游戏过程中发生错误：{e}")
             finally:
                 # 会话监听器已退出，此后没有任何消息会被处理。
                 # 无论因何种原因退出，都必须清掉残留状态，否则 /汤 无法重开
                 if self.game_state.get_game(group_id) is session_game:
                     logger.warning(f"会话已结束但游戏状态残留，强制清理: {group_id}")
-                    self.game_state.end_game(group_id)
+                    self.game_state.end_game(group_id, "cleanup")
         except Exception as e:
             if self.game_state.get_game(group_id) is not session_game:
                 return
             logger.error(f"启动游戏会话失败: {e}")
-            self.game_state.end_game(group_id)
+            self.game_state.end_game(group_id, "error")
             await self._safe_send(event, f"启动游戏会话失败：{e}")
 
     def _reply_result(self, event: AstrMessageEvent, text: str) -> MessageEventResult:
@@ -2593,6 +2744,17 @@ class SoupaiPlugin(Star):
         if isinstance(pass_score, int) and 0 < pass_score <= 100:
             return pass_score
         return self._FALLBACK_PASS_SCORE
+
+    def _archive_finished_round(self, group_id: str, game: dict, ending: str) -> None:
+        """把刚结束的一局写进存档。
+
+        由 GameState.end_game() 调用，异常已在那边吞掉：复盘数据再有用，也
+        不能拦住对局收尾，否则这个群就永远开不了新局。
+        """
+        archive = getattr(self, "game_archive", None)
+        if archive is None:
+            return
+        archive.append(group_id, game, ending)
 
     def _pass_score_for(self, game: dict | None) -> int:
         """本局的验证达标线：配置覆盖优先，其次本局难度，最后普通难度。"""
@@ -2747,7 +2909,7 @@ class SoupaiPlugin(Star):
             await self._send_reply(event, "❌ 只有管理员可以强制结束游戏")
             return
         try:
-            if self.game_state.end_game(group_id):
+            if self.game_state.end_game(group_id, "force_end"):
                 await event.send(event.plain_result("✅ 已强制结束当前海龟汤游戏"))
             else:
                 await event.send(event.plain_result("❌ 当前没有活跃的游戏需要结束"))
@@ -2921,10 +3083,24 @@ class SoupaiPlugin(Star):
                 return
 
             pass_score = self._pass_score_for(game)
-            _, feedback = self._score_band(result.score)
+            level, feedback = self._score_band(result.score)
             best = max(int(game.get("best_score") or 0), result.score)
             game["best_score"] = best
             score_line = f"📊 得分：{result.score}/100（达标线 {pass_score}）"
+
+            # 存档要能复盘玩家究竟提交了什么、拿了多少分。分项留在这里，
+            # 只有网页看得到，群里仍然只显示总分。
+            game.setdefault("verify_history", []).append(
+                {
+                    "guess": user_guess,
+                    "score": result.score,
+                    "breakdown": dict(result.breakdown),
+                    "level": level,
+                    "pass_score": pass_score,
+                    "passed": result.score >= pass_score,
+                    "charged": not already_passed and result.score < pass_score,
+                }
+            )
 
             question_limit = game.get("question_limit")
             questions_exhausted = (
@@ -2940,7 +3116,7 @@ class SoupaiPlugin(Star):
                 # 也只有收场这一次才回 LLM 评价——游戏继续时评价等于免费提示，
                 # 会帮玩家定向补齐还没想到的部分。
                 if result.score >= 100:
-                    self.game_state.end_game(group_id)
+                    self.game_state.end_game(group_id, "perfect_score")
                     await self._safe_send(
                         event,
                         f"{score_line}\n评价：{result.comment}\n\n"
@@ -2982,7 +3158,7 @@ class SoupaiPlugin(Star):
                 )
             elif questions_exhausted:
                 # 提问和验证都用尽，本局无路可走，揭晓答案收场
-                self.game_state.end_game(group_id)
+                self.game_state.end_game(group_id, "exhausted")
                 await self._safe_send(
                     event,
                     f"{score_line}\n❌ 验证机会已用尽。\n"
@@ -3048,7 +3224,7 @@ class SoupaiPlugin(Star):
             yield event.plain_result("此功能只能在群聊中使用")
             return
 
-        if self.game_state.end_game(group_id):
+        if self.game_state.end_game(group_id, "force_end"):
             yield event.plain_result("✅ 已强制结束当前海龟汤游戏")
         else:
             yield event.plain_result("❌ 当前没有活跃的游戏需要结束")

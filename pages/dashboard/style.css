@@ -250,3 +250,11 @@ body {
 .toast[hidden] { display: none; }
 .toast-ok { border-color: var(--ok); color: var(--ok); }
 .toast-error { border-color: var(--danger); color: var(--danger); }
+
+/* ── 对局复盘 ── */
+.replay h4 { margin: 16px 0 6px; font-size: 13px; color: var(--muted); }
+.replay h4:first-child { margin-top: 0; }
+.replay ol { margin: 0; padding-left: 20px; }
+.replay ol li { margin-bottom: 10px; }
+.replay .qa-q { display: block; margin: 0 0 2px; word-break: break-word; }
+.replay > .qa { margin-top: 12px; }

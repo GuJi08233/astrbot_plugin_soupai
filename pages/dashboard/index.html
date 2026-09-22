@@ -14,6 +14,7 @@
     <button class="tab is-active" data-tab="stories">题库</button>
     <button class="tab" data-tab="sessions">会话</button>
     <button class="tab" data-tab="games">对局</button>
+    <button class="tab" data-tab="history">历史</button>
     <button class="tab" data-tab="settings">设置</button>
   </div>
   <div class="refresh-controls">
@@ -64,6 +65,23 @@
   <div id="gameList" class="list"></div>
 </section>
 
+<section class="panel" data-panel="history" hidden>
+  <p class="hint">
+    已结束对局的存档，最新的在最前。列表同样不显示汤底，点「查看复盘」才会带出汤底与完整记录。
+    最多保留 200 局，超出后最旧的会被挤掉。
+  </p>
+  <div class="toolbar">
+    <select id="historySession"><option value="">全部会话</option></select>
+    <button id="historyClear" class="btn btn-ghost">清理存档</button>
+  </div>
+  <div id="historyList" class="list"></div>
+  <div class="toolbar">
+    <button id="historyPrev" class="btn btn-ghost">上一页</button>
+    <span id="historyPage" class="muted"></span>
+    <button id="historyNext" class="btn btn-ghost">下一页</button>
+  </div>
+</section>
+
 <!-- ─────────────── 设置 ─────────────── -->
 <section class="panel" data-panel="settings" hidden>
   <p class="hint">和面板里插件配置是同一份。保存后立即生效，不需要重载插件。</p>
@@ -106,6 +124,18 @@
     <div class="modal-actions">
       <button id="confirmCancel" class="btn btn-ghost">取消</button>
       <button id="confirmOk" class="btn btn-danger">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─────────────── 复盘弹窗 ─────────────── -->
+<div id="replayModal" class="modal" hidden>
+  <div class="modal-box">
+    <h3>对局复盘</h3>
+    <p class="hint">这一局已经结束，所以这里连汤底一起显示。</p>
+    <div id="replayBody" class="replay"></div>
+    <div class="modal-actions">
+      <button id="replayClose" class="btn btn-ghost">关闭</button>
     </div>
   </div>
 </div>

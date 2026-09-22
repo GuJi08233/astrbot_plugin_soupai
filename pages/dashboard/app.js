@@ -102,6 +102,10 @@
     editing: null, // null=新增
     editorSource: 'custom',
     editorVersion: 0,
+    historySession: '',
+    historyOffset: 0,
+    historyPageSize: 20,
+    historyTotal: 0,
   };
 
   const ANNOTATION_LABELS = { missing: '未标注', ready: '已标注', stale: '标注已过期' };
@@ -490,6 +494,67 @@
     return parts.join(' · ');
   }
 
+  /* 问答记录的渲染，进行中的对局和历史存档共用：两边各写一份的话，
+   * Jev 详情这种细节迟早会飘。没有问答时返回 null。 */
+  function renderQaHistory(qaHistory, keyPrefix, expanded) {
+    if (!qaHistory || !qaHistory.length) return null;
+      const details = el('details', 'qa');
+      details.dataset.detailKey = `${keyPrefix}:history`;
+      details.open = expanded.has(details.dataset.detailKey);
+      details.appendChild(el('summary', null, `问答记录（${qaHistory.length}）`));
+      const ol = el('ol');
+      qaHistory.forEach((qa, index) => {
+        const li = el('li');
+        li.appendChild(el('span', 'qa-q', qa.question));
+        li.appendChild(el('span', 'qa-a', qa.answer));
+        const by = judgedByTag(qa.judged_by);
+        if (by) li.appendChild(by);
+        const judgement = qa.judged_by || {};
+        const jev = judgement.jev;
+        if (jev || judgement.engine === 'jev' || (judgement.fallback && !judgement.routing_reason)) {
+          const metrics = el('details', 'judge-details');
+          metrics.dataset.detailKey = `${keyPrefix}:judge:${index}`;
+          metrics.open = expanded.has(metrics.dataset.detailKey);
+          metrics.appendChild(el('summary', null, 'Jev 判定详情'));
+          const info = el('div', 'judge-info');
+          info.appendChild(el('p', null, `Jev 原选项：${jev?.choice || '未提供'}`));
+          const confidence = jev ? jev.confidence : judgement.confidence;
+          info.appendChild(el('p', null,
+            `整体置信度：${formatPercent(confidence)}${!jev && confidence != null ? '（旧记录）' : ''}`));
+          info.appendChild(el('p', null, `采用门槛：${formatPercent(jev?.threshold)}`));
+          const reasons = {
+            low_confidence: '整体置信度低于采用门槛',
+            request_failed: 'Jev 请求失败',
+            invalid_response: 'Jev 响应格式无效',
+            unknown_choice: 'Jev 返回了候选之外的选项',
+          };
+          const reason = jev?.reason === null && judgement.engine === 'jev'
+            ? '无（已采用 Jev 判定）' : reasons[jev?.reason] || '未提供';
+          info.appendChild(el('p', null, `回退原因：${reason}`));
+          metrics.appendChild(info);
+          metrics.appendChild(el('p', 'judge-note muted',
+            '以下为 Jev 返回的选项概率；整体置信度是独立指标，不等于最高选项概率。'));
+          const probabilities = el('dl', 'judge-probabilities');
+          ['是', '否', '不重要', '是也不是'].forEach((choice) => {
+            const row = el('div', 'judge-probability');
+            if (choice === jev?.choice) row.classList.add('is-choice');
+            row.appendChild(el('dt', null, choice));
+            row.appendChild(el('dd', null, formatPercent(jev?.probabilities?.[choice])));
+            probabilities.appendChild(row);
+          });
+          metrics.appendChild(probabilities);
+          if (!jev) {
+            metrics.appendChild(el('p', 'judge-note muted',
+              '旧记录未保存 Jev 原选项、四选项概率、采用门槛和回退原因。'));
+          }
+          li.appendChild(metrics);
+        }
+        ol.appendChild(li);
+      });
+      details.appendChild(ol);
+    return details;
+  }
+
   async function loadGames() {
     const currentList = $('#gameList');
     if (!currentList.children.length) showLoading('#gameList', 2);
@@ -527,63 +592,8 @@
       card.appendChild(el('p', 'muted',
         `提问 ${q} · 提示 ${h} · 验证 ${v}${score}${summary ? ` · 判定 ${summary}` : ''}`));
 
-      if (g.qa_history && g.qa_history.length) {
-        const details = el('details', 'qa');
-        details.dataset.detailKey = `${g.key}:${g.started_at || ''}:history`;
-        details.open = expanded.has(details.dataset.detailKey);
-        details.appendChild(el('summary', null, `问答记录（${g.qa_history.length}）`));
-        const ol = el('ol');
-        g.qa_history.forEach((qa, index) => {
-          const li = el('li');
-          li.appendChild(el('span', 'qa-q', qa.question));
-          li.appendChild(el('span', 'qa-a', qa.answer));
-          const by = judgedByTag(qa.judged_by);
-          if (by) li.appendChild(by);
-          const judgement = qa.judged_by || {};
-          const jev = judgement.jev;
-          if (jev || judgement.engine === 'jev' || (judgement.fallback && !judgement.routing_reason)) {
-            const metrics = el('details', 'judge-details');
-            metrics.dataset.detailKey = `${g.key}:${g.started_at || ''}:judge:${index}`;
-            metrics.open = expanded.has(metrics.dataset.detailKey);
-            metrics.appendChild(el('summary', null, 'Jev 判定详情'));
-            const info = el('div', 'judge-info');
-            info.appendChild(el('p', null, `Jev 原选项：${jev?.choice || '未提供'}`));
-            const confidence = jev ? jev.confidence : judgement.confidence;
-            info.appendChild(el('p', null,
-              `整体置信度：${formatPercent(confidence)}${!jev && confidence != null ? '（旧记录）' : ''}`));
-            info.appendChild(el('p', null, `采用门槛：${formatPercent(jev?.threshold)}`));
-            const reasons = {
-              low_confidence: '整体置信度低于采用门槛',
-              request_failed: 'Jev 请求失败',
-              invalid_response: 'Jev 响应格式无效',
-              unknown_choice: 'Jev 返回了候选之外的选项',
-            };
-            const reason = jev?.reason === null && judgement.engine === 'jev'
-              ? '无（已采用 Jev 判定）' : reasons[jev?.reason] || '未提供';
-            info.appendChild(el('p', null, `回退原因：${reason}`));
-            metrics.appendChild(info);
-            metrics.appendChild(el('p', 'judge-note muted',
-              '以下为 Jev 返回的选项概率；整体置信度是独立指标，不等于最高选项概率。'));
-            const probabilities = el('dl', 'judge-probabilities');
-            ['是', '否', '不重要', '是也不是'].forEach((choice) => {
-              const row = el('div', 'judge-probability');
-              if (choice === jev?.choice) row.classList.add('is-choice');
-              row.appendChild(el('dt', null, choice));
-              row.appendChild(el('dd', null, formatPercent(jev?.probabilities?.[choice])));
-              probabilities.appendChild(row);
-            });
-            metrics.appendChild(probabilities);
-            if (!jev) {
-              metrics.appendChild(el('p', 'judge-note muted',
-                '旧记录未保存 Jev 原选项、四选项概率、采用门槛和回退原因。'));
-            }
-            li.appendChild(metrics);
-          }
-          ol.appendChild(li);
-        });
-        details.appendChild(ol);
-        card.appendChild(details);
-      }
+      const qaBlock = renderQaHistory(g.qa_history, `${g.key}:${g.started_at || ''}`, expanded);
+      if (qaBlock) card.appendChild(qaBlock);
 
       const actions = el('div', 'card-actions');
       const end = el('button', 'btn btn-sm btn-danger', '强制结束');
@@ -609,6 +619,147 @@
         ?.querySelector('summary')?.focus({ preventScroll: true });
     }
     window.scrollTo(...scrollPosition);
+  }
+
+  // ─────────────────────────────────────────── 历史对局
+
+  const ENDING_LABELS = {
+    reveal: '揭晓收场',
+    timeout: '超时结束',
+    perfect_score: '满分通关',
+    exhausted: '次数用尽',
+    force_end: '强制结束',
+    web_end: '网页结束',
+    unload: '插件卸载',
+    cleanup: '状态清理',
+    error: '异常结束',
+    aborted: '开局中断',
+    unknown: '未记录',
+  };
+
+  function formatMoment(value) {
+    if (!value) return '时间未知';
+    const at = new Date(value);
+    return Number.isNaN(at.getTime()) ? value : at.toLocaleString();
+  }
+
+  async function loadHistory() {
+    const box = $('#historyList');
+    if (!box.children.length) showLoading('#historyList', 3);
+    const params = { limit: state.historyPageSize, offset: state.historyOffset };
+    if (state.historySession) params.session = state.historySession;
+    const data = await api.get('history', params);
+    state.historyTotal = data.total || 0;
+
+    const picker = $('#historySession');
+    const previous = state.historySession;
+    picker.innerHTML = '';
+    picker.appendChild(new Option('全部会话', ''));
+    (data.sessions || []).forEach((s) => {
+      picker.appendChild(new Option(`${s.label}（${s.count}）`, s.session));
+    });
+    picker.value = previous;
+
+    const list = document.createDocumentFragment();
+    if (!data.games.length) {
+      list.appendChild(el('div', 'empty',
+        state.historyOffset ? '这一页没有记录了' : '还没有结束的对局'));
+    }
+    data.games.forEach((g) => {
+      const card = el('div', 'card');
+      const head = el('div', 'card-head');
+      head.appendChild(el('strong', null, g.label || g.group_id || '未知会话'));
+      if (g.difficulty) head.appendChild(el('span', 'tag', g.difficulty));
+      head.appendChild(el('span', 'tag tag-muted',
+        ENDING_LABELS[g.ending] || g.ending || '未记录'));
+      if (g.passed) head.appendChild(el('span', 'tag tag-jev', '已达标'));
+      card.appendChild(head);
+      card.appendChild(el('p', 'puzzle', g.puzzle));
+
+      const q = g.question_limit
+        ? `${g.question_count || 0}/${g.question_limit}` : `${g.question_count || 0}`;
+      const score = g.best_score
+        ? `最高分 ${g.best_score}/100（达标线 ${g.pass_score}）` : '未验证过';
+      const summary = judgeSummary(g.qa_history || []);
+      card.appendChild(el('p', 'muted',
+        `${formatMoment(g.ended_at)} · 提问 ${q} · 提示 ${g.hint_count || 0}`
+        + ` · 验证 ${(g.verify_history || []).length} · ${score}`
+        + `${summary ? ` · 判定 ${summary}` : ''}`));
+
+      const actions = el('div', 'card-actions');
+      const open = el('button', 'btn btn-sm', '查看复盘');
+      open.onclick = () => openReplay(g.id);
+      actions.appendChild(open);
+      card.appendChild(actions);
+      list.appendChild(card);
+    });
+    box.replaceChildren(list);
+
+    const from = state.historyTotal ? state.historyOffset + 1 : 0;
+    const to = Math.min(state.historyOffset + state.historyPageSize, state.historyTotal);
+    $('#historyPage').textContent = `${from}-${to} / 共 ${state.historyTotal} 局`;
+    $('#historyPrev').disabled = state.historyOffset <= 0;
+    $('#historyNext').disabled = to >= state.historyTotal;
+  }
+
+  /* 单局复盘。列表里没有汤底，这里才单独取一次。 */
+  async function openReplay(id) {
+    let game;
+    try {
+      game = await api.get('history/detail', { id });
+    } catch (err) {
+      toast(err.message || String(err), 'error');
+      return;
+    }
+    const body = $('#replayBody');
+    body.innerHTML = '';
+
+    body.appendChild(el('p', 'muted',
+      `${game.label || game.group_id || ''} · ${game.difficulty || '普通'} · `
+      + `${ENDING_LABELS[game.ending] || game.ending || '未记录'} · `
+      + `${formatMoment(game.started_at)} → ${formatMoment(game.ended_at)}`));
+
+    body.appendChild(el('h4', null, '汤面'));
+    body.appendChild(el('p', 'puzzle', game.puzzle));
+    body.appendChild(el('h4', null, '汤底'));
+    body.appendChild(el('p', 'answer-text', game.answer || '（未记录）'));
+
+    const qaBlock = renderQaHistory(game.qa_history, `replay:${game.id}`, new Set());
+    if (qaBlock) {
+      qaBlock.open = true;
+      body.appendChild(qaBlock);
+    }
+
+    if (game.hint_history && game.hint_history.length) {
+      body.appendChild(el('h4', null, `提示（${game.hint_history.length}）`));
+      const ol = el('ol');
+      game.hint_history.forEach((hint) => ol.appendChild(el('li', null, hint)));
+      body.appendChild(ol);
+    }
+
+    if (game.verify_history && game.verify_history.length) {
+      body.appendChild(el('h4', null, `验证（${game.verify_history.length}）`));
+      const ol = el('ol');
+      game.verify_history.forEach((v) => {
+        const li = el('li');
+        li.appendChild(el('p', 'qa-q', v.guess));
+        const parts = [`得分 ${v.score}/100`];
+        if (v.pass_score != null) parts.push(`达标线 ${v.pass_score}`);
+        if (v.level) parts.push(v.level);
+        parts.push(v.passed ? '达标' : '未达标');
+        if (!v.charged) parts.push('未计次');
+        const b = v.breakdown || {};
+        if (b.facts != null) {
+          // 分项只在这里出现：群里显示会告诉玩家还有哪一块没想到
+          parts.push(`事实 ${b.facts} · 动机 ${b.motive} · 反转 ${b.twist}`);
+        }
+        li.appendChild(el('p', 'muted', parts.join(' · ')));
+        ol.appendChild(li);
+      });
+      body.appendChild(ol);
+    }
+
+    $('#replayModal').hidden = false;
   }
 
   // ─────────────────────────────────────────── 弹窗
@@ -1059,6 +1210,7 @@
         await loadOverview();
         if (state.tab === tab) await loadStories();
       } else if (tab === 'sessions') await loadSessions();
+      else if (tab === 'history') await loadHistory();
       else if (tab === 'games') await loadGames();
       else if (tab === 'settings') preservedConfig = await loadConfig() === false;
 
@@ -1219,6 +1371,32 @@
   };
   $('#confirmOk').onclick = () => closeConfirm(true);
   $('#confirmCancel').onclick = () => closeConfirm(false);
+  $('#replayClose').onclick = () => { $('#replayModal').hidden = true; };
+  $('#historySession').onchange = (e) => {
+    state.historySession = e.target.value;
+    state.historyOffset = 0;
+    refreshCurrentTab();
+  };
+  $('#historyPrev').onclick = () => {
+    state.historyOffset = Math.max(state.historyOffset - state.historyPageSize, 0);
+    refreshCurrentTab();
+  };
+  $('#historyNext').onclick = () => {
+    state.historyOffset += state.historyPageSize;
+    refreshCurrentTab();
+  };
+  $('#historyClear').onclick = async () => {
+    const scoped = state.historySession;
+    const ok = await confirmDialog(
+      scoped ? '清理这个会话的存档？' : '清空全部对局存档？',
+      '存档删掉就找不回来了，不影响题库和使用记录。',
+      { okText: '清理' },
+    );
+    if (!ok) return;
+    await guard(api.post('history/clear', scoped ? { session: scoped } : {}), '已清理');
+    state.historyOffset = 0;
+    refreshCurrentTab();
+  };
   // 关掉确认框必须走 closeConfirm，否则等它的 Promise 永远不落地
   function dismissModal(modal) {
     if (modal.id === 'confirmModal') closeConfirm(false);

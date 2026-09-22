@@ -128,9 +128,14 @@ GEN_PROMPT = """你在为海龟汤评测集出题。给定一个海龟汤的汤�
 汤底：{answer}"""
 
 
-async def chat(client: httpx.AsyncClient, model: str, prompt: str,
-               system: str | None = None, temperature: float = 0.0,
-               max_tokens: int = 4096) -> str:
+async def chat(
+    client: httpx.AsyncClient,
+    model: str,
+    prompt: str,
+    system: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+) -> str:
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -179,7 +184,8 @@ async def gen_questions(client, model, puzzle, answer, sem):
     async with sem:
         try:
             text = await chat(
-                client, model,
+                client,
+                model,
                 GEN_PROMPT.format(per_kind=PER_KIND, puzzle=puzzle, answer=answer),
                 temperature=0.7,
             )
@@ -230,8 +236,11 @@ async def llm_judge(client, model, answer, question, sem):
         t0 = time.monotonic()
         try:
             text = await chat(
-                client, model, llm_prompt(question, answer),
-                system=SYSTEM_PROMPT, max_tokens=2048,
+                client,
+                model,
+                llm_prompt(question, answer),
+                system=SYSTEM_PROMPT,
+                max_tokens=2048,
             )
             reply = text.strip()
             for v in VALID:  # tolerate e.g. "是。" — same fallback spirit as plugin
@@ -246,7 +255,8 @@ async def llm_judge(client, model, answer, question, sem):
             }
         except Exception as e:
             return {
-                "choice": None, "raw": "",
+                "choice": None,
+                "raw": "",
                 "latency": round(time.monotonic() - t0, 3),
                 "error": str(e),
             }
@@ -266,18 +276,20 @@ def bins(rows, key):
     out = []
     for lo, hi in zip(edges, edges[1:]):
         sel = [
-            r for r in rows
-            if r[key]["confidence"] is not None
-            and lo <= r[key]["confidence"] < hi
+            r
+            for r in rows
+            if r[key]["confidence"] is not None and lo <= r[key]["confidence"] < hi
         ]
         if not sel:
             continue
         correct = sum(1 for r in sel if r[key]["choice"] == r["gold"])
-        out.append({
-            "range": f"[{lo:.1f},{hi if hi <= 1 else 1.0:.1f})",
-            "n": len(sel),
-            "acc": round(correct / len(sel), 3),
-        })
+        out.append(
+            {
+                "range": f"[{lo:.1f},{hi if hi <= 1 else 1.0:.1f})",
+                "n": len(sel),
+                "acc": round(correct / len(sel), 3),
+            }
+        )
     return out
 
 
@@ -304,8 +316,10 @@ async def main():
     try:
         models = (await client.get("/v1/models", timeout=30.0)).json()
         ids = [m["id"] for m in models.get("data", [])]
-        print(f"models on relay ({len(ids)}): "
-              f"{[i for i in ids if 'jev' in i or 'step-3' in i][:10]}")
+        print(
+            f"models on relay ({len(ids)}): "
+            f"{[i for i in ids if 'jev' in i or 'step-3' in i][:10]}"
+        )
     except Exception as e:
         print(f"model list failed (continuing anyway): {e}")
 
@@ -322,12 +336,14 @@ async def main():
     rows = []
     for story, qs in zip(sample, gen_results):
         for q in qs:
-            rows.append({
-                "story_id": story.get("id"),
-                "puzzle": story["puzzle"],
-                "answer": story["answer"],
-                **q,
-            })
+            rows.append(
+                {
+                    "story_id": story.get("id"),
+                    "puzzle": story["puzzle"],
+                    "answer": story["answer"],
+                    **q,
+                }
+            )
     # dedup identical questions within a story
     seen, deduped = set(), []
     for r in rows:
@@ -336,8 +352,10 @@ async def main():
             seen.add(k)
             deduped.append(r)
     rows = deduped
-    print(f"generated {len(rows)} questions "
-          f"(gold dist: {dict((v, sum(1 for r in rows if r['gold'] == v)) for v in VALID)})")
+    print(
+        f"generated {len(rows)} questions "
+        f"(gold dist: {{v: sum(1 for r in rows if r['gold'] == v) for v in VALID}})"
+    )
     by_kind = {}
     for r in rows:
         by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
@@ -356,8 +374,8 @@ async def main():
     jev_results, llm_results = await asyncio.gather(
         asyncio.gather(*jev_tasks), asyncio.gather(*llm_tasks)
     )
-    for r, j, l in zip(rows, jev_results, llm_results):
-        r["jev"], r["llm"] = j, l
+    for r, j, llm in zip(rows, jev_results, llm_results):
+        r["jev"], r["llm"] = j, llm
 
     RESULTS_PATH.write_text(
         json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -386,14 +404,20 @@ async def main():
 
     print("\n== probability distribution sanity ==")
     sums = [
-        sum(p for p in r["jev"]["probabilities"].values() if isinstance(p, (int, float)))
-        for r in rows if r["jev"]["probabilities"]
+        sum(
+            p for p in r["jev"]["probabilities"].values() if isinstance(p, (int, float))
+        )
+        for r in rows
+        if r["jev"]["probabilities"]
     ]
     if sums:
         sums.sort()
-        print(f"  prob sum: min={sums[0]:.3f} median={sums[len(sums)//2]:.3f} max={sums[-1]:.3f}")
+        print(
+            f"  prob sum: min={sums[0]:.3f} median={sums[len(sums) // 2]:.3f} max={sums[-1]:.3f}"
+        )
     agrees = [
-        r for r in rows
+        r
+        for r in rows
         if r["jev"]["probabilities"]
         and max(r["jev"]["probabilities"], key=r["jev"]["probabilities"].get)
         == r["jev"]["choice"]
@@ -403,22 +427,23 @@ async def main():
     spreads = [
         max(r["jev"]["probabilities"].values())
         - sorted(r["jev"]["probabilities"].values())[-2]
-        for r in rows if len(r["jev"]["probabilities"]) >= 2
+        for r in rows
+        if len(r["jev"]["probabilities"]) >= 2
     ]
     if spreads:
         spreads.sort()
-        print(f"  top1-top2 spread: median={spreads[len(spreads)//2]:.3f}")
+        print(f"  top1-top2 spread: median={spreads[len(spreads) // 2]:.3f}")
 
-    print("\n== threshold tradeoff (adopt jev if confidence>=t else fall back to llm) ==")
+    print(
+        "\n== threshold tradeoff (adopt jev if confidence>=t else fall back to llm) =="
+    )
     print("  t      adopt%  jev_adopted_acc  blended_acc(jev+llm fallback)")
     llm_map = {id(r): r["llm"]["choice"] for r in rows}
     for t in (0.0, 0.3, 0.5, 0.7, 0.9):
         adopted, adopted_correct, blended, blended_n = 0, 0, 0, 0
         for r in rows:
             conf = r["jev"]["confidence"]
-            use_jev = (
-                conf is not None and conf >= t and r["jev"]["choice"] in VALID
-            )
+            use_jev = conf is not None and conf >= t and r["jev"]["choice"] in VALID
             final = r["jev"]["choice"] if use_jev else llm_map[id(r)]
             if final not in VALID:
                 continue
@@ -429,19 +454,21 @@ async def main():
                 adopted_correct += r["jev"]["choice"] == r["gold"]
         if blended_n:
             print(
-                f"  {t:.1f}    {adopted/blended_n:6.1%}  "
-                f"{(adopted_correct/adopted) if adopted else float('nan'):.3f}          "
-                f"{blended/blended_n:.3f}"
+                f"  {t:.1f}    {adopted / blended_n:6.1%}  "
+                f"{(adopted_correct / adopted) if adopted else float('nan'):.3f}          "
+                f"{blended / blended_n:.3f}"
             )
 
     print("\n== disagreements (sample) ==")
     shown = 0
     for r in rows:
-        j, l = r["jev"]["choice"], r["llm"]["choice"]
-        if j in VALID and l in VALID and j != l and shown < 8:
+        j, llm = r["jev"]["choice"], r["llm"]["choice"]
+        if j in VALID and llm in VALID and j != llm and shown < 8:
             flag_j = "✓" if j == r["gold"] else "✗"
-            flag_l = "✓" if l == r["gold"] else "✗"
-            print(f"  [{r['kind']}] gold={r['gold']} jev={j}{flag_j} llm={l}{flag_l}  {r['question'][:40]}")
+            flag_l = "✓" if llm == r["gold"] else "✗"
+            print(
+                f"  [{r['kind']}] gold={r['gold']} jev={j}{flag_j} llm={llm}{flag_l}  {r['question'][:40]}"
+            )
             shown += 1
 
     await client.aclose()
