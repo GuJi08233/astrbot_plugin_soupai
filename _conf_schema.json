@@ -196,5 +196,74 @@
     "condition": {
       "judge_engine": "jev"
     }
+  },
+  "reward_enabled": {
+    "description": "对局结束后发放代币奖励",
+    "type": "bool",
+    "hint": "开启后每局结束按各人贡献分配游戏币，需要另行安装「链上游戏币」插件。发的是那个插件的站内余额，不直接上链，提现仍受它的单次与每日限额约束。判定引擎选 Jev 时会顺带评估每次提问的贡献度（搭在同一次请求上，几乎不增加延迟）；用 LLM 引擎则所有提问按同一权重计。",
+    "default": false
+  },
+  "reward_plugin": {
+    "description": "发币插件名",
+    "type": "string",
+    "hint": "提供 grant() 接口的插件标识，默认 astrbot_plugin_token_faucet。插件没装、没启用或改了接口时本局不发奖，不影响正常游戏。",
+    "default": "astrbot_plugin_token_faucet",
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_pool": {
+    "description": "每局奖池",
+    "type": "int",
+    "hint": "一局结束后在所有正贡献玩家之间按权重瓜分的总代币数，取整余数归贡献最高者。",
+    "default": 20,
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_daily_cap": {
+    "description": "每人每日上限",
+    "type": "int",
+    "hint": "同一玩家每天从海龟汤能拿到的代币上限，由发币插件在同一个事务里守住。0 表示不限——不建议，海龟汤可以无限开局。",
+    "default": 100,
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_min_questions": {
+    "description": "发奖的最少提问数",
+    "type": "int",
+    "hint": "一局里有归属的提问少于这个数就不发奖，防止开一局问两句就结算来刷币。",
+    "default": 5,
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_verify_weight": {
+    "description": "破案加权",
+    "type": "float",
+    "hint": "达标通过的玩家按 得分/100 × 该权重获得额外贡献。调高更奖励临门一脚，调低更奖励集体推理。",
+    "default": 3.0,
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_hint_penalty": {
+    "description": "每次提示扣减的贡献",
+    "type": "float",
+    "hint": "提示次数是全队共享的，谁用掉就扣谁的贡献。作为参照：一次「关键」提问计 3 分，「有效」计 1.5 分。",
+    "default": 1.0,
+    "condition": {
+      "reward_enabled": true
+    }
+  },
+  "reward_verify_penalty": {
+    "description": "每次未达标验证扣减的贡献",
+    "type": "float",
+    "hint": "未达标的验证同样消耗全队次数，但比提示轻——猜错是推理的一部分。达标后的自愿刷分不扣。",
+    "default": 0.5,
+    "condition": {
+      "reward_enabled": true
+    }
   }
 }

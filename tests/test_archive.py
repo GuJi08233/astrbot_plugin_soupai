@@ -28,6 +28,7 @@ class ArchiveTests(unittest.TestCase):
             },
             "astrbot.api.event": {
                 "AstrMessageEvent": object,
+                "MessageChain": object,
                 "MessageEventResult": object,
                 "filter": SimpleNamespace(
                     command=decorate,

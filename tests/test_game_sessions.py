@@ -109,6 +109,7 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
             unified_msg_origin="test:GroupMessage:group",
             get_group_id=lambda: "group",
             get_sender_id=lambda: "player-one",
+            get_sender_name=lambda: "Player One",
             plain_result=lambda text: text,
             send=AsyncMock(),
             is_admin=Mock(return_value=admin),

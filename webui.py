@@ -696,6 +696,17 @@ class SoupaiWebApi:
         "auto_generate_min": (0, 500),
         "verification_limit": (0, 100),
         "verification_pass_score": (0, 100),
+        # 和 main.py 的 _config_number 上下界保持一致：那边越界会静默回落到
+        # 默认值，在这里拦住才能告诉用户填错了
+        "reward_pool": (1, 100000),
+        "reward_daily_cap": (0, 1000000),
+        "reward_min_questions": (0, 1000),
+    }
+    _FLOAT_RANGES = {
+        "jev_judge_min_confidence": (0, 1),
+        "reward_hint_penalty": (0, 100),
+        "reward_verify_penalty": (0, 100),
+        "reward_verify_weight": (0, 100),
     }
 
     def _providers_payload(self, kind: str = "chat") -> list[dict]:
@@ -791,8 +802,9 @@ class SoupaiWebApi:
                     value = float(value)
                 except (TypeError, ValueError):
                     return error_response(f"{key} 需要是数字")
-                if key == "jev_judge_min_confidence" and not 0 <= value <= 1:
-                    return error_response("Jev 置信度门槛需要在 0 ~ 1 之间")
+                lo, hi = self._FLOAT_RANGES.get(key, (float("-inf"), float("inf")))
+                if not lo <= value <= hi:
+                    return error_response(f"{key} 需要在 {lo} ~ {hi} 之间")
             elif ftype == "bool":
                 value = bool(value)
             elif ftype == "string":

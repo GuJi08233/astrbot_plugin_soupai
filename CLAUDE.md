@@ -325,6 +325,30 @@ add an automatic full-library annotation task during plugin initialization.
   another. `_RUNTIME_KEYS` keeps `_session_task` (not serialisable) and
   `_player_qa` out of the file. Rounds with no questions, hints or
   verifications are not worth archiving.
+- **Reward settlement rides that same hook and never blocks it.**
+  `_settle_rewards()` runs from `on_end` so every exit is covered, but the
+  payout itself is detached: a slow or dead faucet must not keep `end_game()`
+  from returning. The `rewarded` flag makes it idempotent, and `unload` is not
+  a finished round — reloading the plugin must not pay anyone. Contribution
+  grades ride along on the existing judging request via `_jev_choice`'s
+  `extra_choices`, because Jev evaluates every question in one call
+  independently against the same state; enabling rewards therefore costs no
+  extra API call, and with no rider the payload keeps its original
+  single-question shape, which the judging tests pin byte for byte. A grade is
+  settlement-only — never surface it, since 「关键」 confirms for free that the
+  player's line of questioning is right. Weigh a grade by its whole probability
+  distribution, not by the top option: measured on one puzzle, 「枪是真的吗」
+  came back 关键 .15 / 有效 .41 / 次要 .44, which the top option prices at 0.3 —
+  the same as 「酒吧的墙是什么颜色」 — while the expectation puts it at 1.2. A
+  sharp distribution gives the same answer either way, so this only moves the
+  questions the model itself is unsure about. Money moves through the faucet
+  plugin's `grant()`, which owns the per-day ceiling inside one transaction:
+  do not reimplement that cap here, and treat a missing faucet plugin as "no
+  reward", never as an error. Per-player attribution lives on the records
+  themselves (`player_id` / `player_name` added to `qa_history` and
+  `verify_history`); hints get a parallel `hint_credits` list instead, because
+  `hint_history` is a list of plain strings that both hint generation and the
+  web page read in that shape.
 - **Never put an answer in a list response.** `stories` and `games` return
   puzzles only; `story/answer` is a separate, deliberate request. Annotation
   content is equally spoiler-bearing and belongs only in explicit detail

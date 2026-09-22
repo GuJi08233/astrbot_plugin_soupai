@@ -30,6 +30,7 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
             },
             "astrbot.api.event": {
                 "AstrMessageEvent": object,
+                "MessageChain": object,
                 "MessageEventResult": object,
                 "filter": SimpleNamespace(
                     command=decorate,
@@ -192,6 +193,71 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
+
+    async def test_contribution_rider_shares_the_judging_request(self):
+        """贡献评级搭在同一次请求上，不另开一次，也不动判定结果。"""
+        self.plugin.reward_enabled = True
+        self.response_data = {
+            "answers": {
+                "verdict": self.answer,
+                "contribution": {"type": "choice", "choice": "关键"},
+            }
+        }
+        reply, source = await self.plugin.judge_question("Test?", "Test answer")
+
+        self.assertEqual(reply, "是")
+        self.assertEqual(source["contribution"], "关键")
+        self.assertEqual(len(self.requests), 1)
+        questions = json.loads(self.requests[0].content)["questions"]
+        self.assertEqual(questions["verdict"]["criteria"], self.plugin._JUDGE_CRITERIA)
+        self.assertEqual(
+            questions["contribution"]["criteria"],
+            self.plugin._CONTRIBUTION_CRITERIA,
+        )
+
+    async def test_contribution_probabilities_are_kept_for_settlement(self):
+        """结算按分布折算，所以分布要原样留下，不能只留最大项。"""
+        self.plugin.reward_enabled = True
+        self.response_data = {
+            "answers": {
+                "verdict": self.answer,
+                "contribution": {
+                    "choice": "次要",
+                    "probabilities": {
+                        "关键": 0.15,
+                        "有效": 0.41,
+                        "次要": 0.44,
+                        "重复": 0.0,
+                    },
+                },
+            }
+        }
+        _, source = await self.plugin.judge_question("Test?", "Test answer")
+
+        self.assertEqual(source["contribution"], "次要")
+        self.assertEqual(source["contribution_probabilities"]["有效"], 0.41)
+
+    async def test_unknown_contribution_grade_is_dropped_not_guessed(self):
+        self.plugin.reward_enabled = True
+        self.response_data = {
+            "answers": {"verdict": self.answer, "contribution": {"choice": "史诗级"}}
+        }
+        reply, source = await self.plugin.judge_question("Test?", "Test answer")
+
+        self.assertEqual(reply, "是")
+        self.assertNotIn("contribution", source)
+
+    async def test_contribution_survives_a_verdict_that_falls_back(self):
+        """判定因置信度不足回退给 LLM，已经拿到的评级依然有效。"""
+        self.plugin.reward_enabled = True
+        self.plugin.jev_judge_min_confidence = 0.95
+        self.response_data = {
+            "answers": {"verdict": self.answer, "contribution": {"choice": "有效"}}
+        }
+        _, source = await self.plugin.judge_question("Test?", "Test answer")
+
+        self.assertEqual(source["engine"], "llm")
+        self.assertEqual(source["contribution"], "有效")
 
     async def test_successful_judgment_keeps_jev_diagnostics(self):
         reply, source = await self.plugin.judge_question("Test?", "Test answer")
