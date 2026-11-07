@@ -24,7 +24,10 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 ## Key Components
 
 - **Network puzzle database**: `network_soupai.json`, 188 puzzles, each with a
-  stable `id` (sha1 of the puzzle text, first 12 hex chars)
+  stable `id` (sha1 of the puzzle text, first 12 hex chars), plus `title`,
+  `category` (本格/变格) and `difficulty` (easy/medium/hard). The id is derived
+  from the puzzle text, so regenerating the bank must preserve the text or every
+  usage record is lost.
 - **Configuration**: `_conf_schema.json` defines plugin settings
 - **Metadata**: `metadata.yaml` for plugin registration
 - **Derived story data**: `story_catalog.json` in the plugin data directory;
@@ -297,6 +300,15 @@ add an automatic full-library annotation task during plugin initialization.
 
 ## Invariants Worth Keeping
 
+- **Two different things are both called "difficulty".** The group's `/汤难度`
+  setting (`group_difficulty`) drives question limits, hint counts and the pass
+  mark; a story's own `difficulty` field (`easy`/`medium`/`hard`) decides how
+  hard the drawn puzzle is. `_story_difficulty()` maps the former to the latter
+  at draw time. When the requested level runs out, `pick_story()` falls back to
+  the whole bank **before** clearing the session's usage record — otherwise a
+  group with few hard puzzles would replay the same ones forever. Stories
+  without a `difficulty` field stay reachable, so an un-annotated custom bank
+  still works.
 - **Clear game state before sending the closing message.** `event.send`
   raises when the platform is offline; if `end_game()` runs after it, the
   round stays "active" forever and `/汤` can never start a new one.

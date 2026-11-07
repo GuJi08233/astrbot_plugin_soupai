@@ -463,5 +463,74 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.story_catalog.check.assert_not_awaited()
 
 
+class StoryDifficultyPickTests(unittest.TestCase):
+    """群难度决定抽到多难的题，而不只是次数上限。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = judging_runtime.JudgingTests.module
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="soupai-difficulty-tests-")
+        self.addCleanup(temporary.cleanup)
+        self.data_path = Path(temporary.name)
+
+    def _storage(self, stories):
+        storage = self.module.LocalSoupaiStorage(
+            self.data_path / "local.json", max_size=50, data_path=self.data_path
+        )
+        storage.stories = [dict(item) for item in stories]
+        return storage
+
+    def test_group_difficulty_maps_to_story_difficulty(self):
+        mapping = self.module.SoupaiPlugin._DIFFICULTY_TO_STORY
+        for group_level in ("简单", "普通", "困难", "666开挂了"):
+            with self.subTest(group_level=group_level):
+                self.assertIn(
+                    self.module.SoupaiPlugin._story_difficulty(group_level),
+                    ("easy", "medium", "hard"),
+                )
+        # 题目只有三档，简单与开挂两端各映射到最近的档位
+        self.assertEqual(mapping["简单"], "easy")
+        self.assertEqual(mapping["666开挂了"], "hard")
+        # 未知档位返回 None，表示不限难度
+        self.assertIsNone(self.module.SoupaiPlugin._story_difficulty("不存在的档位"))
+
+    def test_pick_respects_the_requested_difficulty(self):
+        storage = self._storage(
+            [
+                {"id": "a", "puzzle": "p1", "answer": "a1", "difficulty": "easy"},
+                {"id": "b", "puzzle": "p2", "answer": "a2", "difficulty": "hard"},
+                {"id": "c", "puzzle": "p3", "answer": "a3", "difficulty": "hard"},
+            ]
+        )
+        # 只抽一轮：两道 hard 都没出过时，easy 那道不能混进来
+        picked = {storage.pick_story("s", "hard") for _ in range(2)}
+        self.assertEqual({puzzle for puzzle, _ in picked}, {"p2", "p3"})
+
+    def test_unlabelled_stories_stay_reachable(self):
+        """没有 difficulty 的旧题不能因为筛选而永远抽不到。"""
+        storage = self._storage(
+            [{"id": "old", "puzzle": "legacy", "answer": "legacy answer"}]
+        )
+        self.assertEqual(storage.pick_story("s", "hard"), ("legacy", "legacy answer"))
+
+    def test_exhausted_difficulty_falls_back_to_the_whole_bank(self):
+        """指定难度的题全部出完后要退回全库，否则这个群就没题可出了。"""
+        storage = self._storage(
+            [
+                {"id": "a", "puzzle": "p1", "answer": "a1", "difficulty": "easy"},
+                {"id": "b", "puzzle": "p2", "answer": "a2", "difficulty": "hard"},
+                {"id": "c", "puzzle": "p3", "answer": "a3", "difficulty": "hard"},
+            ]
+        )
+        first = storage.pick_story("s", "hard")
+        second = storage.pick_story("s", "hard")
+        self.assertEqual({first[0], second[0]}, {"p2", "p3"})
+        # 两道 hard 都出过了，这一轮退回全库而不是空转
+        third = storage.pick_story("s", "hard")
+        self.assertEqual(third, ("p1", "a1"))
+
+
 if __name__ == "__main__":
     unittest.main()

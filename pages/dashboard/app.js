@@ -97,6 +97,7 @@
     keyword: '',
     searchAnswer: false,
     session: '',
+    difficulty: '',
     sources: [],
     sessions: [],
     editing: null, // null=新增
@@ -109,6 +110,7 @@
   };
 
   const ANNOTATION_LABELS = { missing: '未标注', ready: '已标注', stale: '标注已过期' };
+  const DIFFICULTY_LABELS = { easy: '简单', medium: '普通', hard: '困难' };
 
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => {
@@ -243,7 +245,7 @@
   }
 
   async function loadStories() {
-    const selection = JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session]);
+    const selection = JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session, state.difficulty]);
     const params = {
       source: state.source,
       page: state.page,
@@ -252,10 +254,11 @@
     if (state.keyword) params.q = state.keyword;
     if (state.searchAnswer) params.search_answer = '1';
     if (state.session) params.session = state.session;
+    if (state.difficulty) params.difficulty = state.difficulty;
 
     if (!$('#list').children.length) showLoading('#list', 4);
     const data = await api.get('stories', params);
-    if (selection !== JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session])) return;
+    if (selection !== JSON.stringify([state.source, state.page, state.keyword, state.searchAnswer, state.session, state.difficulty])) return;
     const snapshot = JSON.stringify([selection, data]);
     if ($('#list').dataset.snapshot === snapshot) return;
     state.total = data.total;
@@ -286,6 +289,11 @@
     const tags = el('div', 'tags');
     if (item.used) tags.appendChild(el('span', 'tag tag-used', state.session ? '本会话已出' : '出过'));
     if (item.hidden) tags.appendChild(el('span', 'tag tag-muted', '已屏蔽'));
+    // 难度和分类来自题库元数据；旧题库没有这两个字段时不显示空标签
+    if (item.difficulty) {
+      tags.appendChild(el('span', `tag tag-diff-${item.difficulty}`, DIFFICULTY_LABELS[item.difficulty] || item.difficulty));
+    }
+    if (item.category) tags.appendChild(el('span', 'tag tag-category', item.category));
     const annotationStatus = item.annotation_status || 'missing';
     const annotationTag = el('span', `tag tag-${annotationStatus}`, ANNOTATION_LABELS[annotationStatus] || '未标注');
     tags.appendChild(annotationTag);
@@ -293,6 +301,7 @@
     head.appendChild(el('span', 'card-id', `#${item.index}`));
     card.appendChild(head);
 
+    if (item.title) card.appendChild(el('p', 'story-title', item.title));
     card.appendChild(el('p', 'puzzle', item.puzzle));
 
     // 汤底默认折叠，点一次才拉取
@@ -1335,6 +1344,12 @@
   $('#sessionFilter').onchange = (e) => {
     state.session = e.target.value;
     state.page = 1;
+    refreshCurrentTab();
+  };
+  $('#difficultyFilter').onchange = (e) => {
+    state.difficulty = e.target.value;
+    state.page = 1;
+    $('#list').dataset.snapshot = '';
     refreshCurrentTab();
   };
   $('#prev').onclick = () => { if (state.page > 1) { state.page--; refreshCurrentTab(); } };

@@ -216,10 +216,24 @@ class ThreadSafeStoryStorage:
 
     # ---------------------------------------------------------------- pick
 
-    def pick_story(self, session: str) -> tuple[str, str] | None:
+    def pick_story(
+        self, session: str, difficulty: str | None = None
+    ) -> tuple[str, str] | None:
         """为某个会话取一道没出过、也没被屏蔽的题。
 
         该会话把可用的题出完后，只重置这个会话的记录，不影响其他会话。
+
+        传了 ``difficulty`` 时优先只在该难度的题里取。难度是题目自身的属性
+        （``easy``/``medium``/``hard``），与群里的 `/汤难度` 设置是两回事：
+        后者决定提问次数和达标线，前者决定抽到多难的题。指定难度的题出完了
+        就退回全题库，而不是让这个群没题可出。
+
+        Args:
+            session: 会话标识，使用记录按它分桶。
+            difficulty: 期望的题目难度；None 或没有匹配时退回全库。
+
+        Returns:
+            ``(puzzle, answer)``，题库为空时返回 None。
         """
         with self.lock:
             if not self.stories:
@@ -234,21 +248,41 @@ class ThreadSafeStoryStorage:
             if not candidates:
                 return None
 
-            available = [
-                (i, s) for i, s in candidates if self.story_id(s, i) not in used
-            ]
+            # 难度只在匹配到题时收窄范围；没有这个字段的旧题仍可被抽到
+            narrowed = candidates
+            if difficulty:
+                matched = [
+                    (i, s) for i, s in candidates if s.get("difficulty") == difficulty
+                ]
+                if matched:
+                    narrowed = matched
+
+            available = [(i, s) for i, s in narrowed if self.story_id(s, i) not in used]
             if not available:
-                logger.info(
-                    f"{self.storage_name} 对会话 {session} 已出完，清空该会话记录重新开始"
-                )
-                used.clear()
-                available = candidates
+                # 先退回全库，再考虑清空记录：该难度的题出完了还有别的题可出，
+                # 重开一轮难度筛选会把同一批难题反复出给这个群。
+                available = [
+                    (i, s) for i, s in candidates if self.story_id(s, i) not in used
+                ]
+                if available:
+                    logger.info(
+                        f"{self.storage_name} 对会话 {session} 的"
+                        f"{difficulty or '全部'}难度已出完，改为从全库取题"
+                    )
+                else:
+                    logger.info(
+                        f"{self.storage_name} 对会话 {session} 已出完，"
+                        "清空该会话记录重新开始"
+                    )
+                    used.clear()
+                    available = candidates
 
             index, story = random.choice(available)
             used.add(self.story_id(story, index))
             self.save_usage_record()
             logger.info(
-                f"{self.storage_name} 取题 id={self.story_id(story, index)}，"
+                f"{self.storage_name} 取题 id={self.story_id(story, index)}"
+                f"（难度 {story.get('difficulty', '未标注')}），"
                 f"该会话已出 {len(used)}/{len(candidates)}"
             )
             return story["puzzle"], story["answer"]
@@ -525,9 +559,19 @@ class NetworkSoupaiStorage(ThreadSafeStoryStorage):
             logger.error(f"加载网络海龟汤失败: {e}")
             self.stories = []
 
-    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
-        """为指定会话取一道网络题"""
-        return self.pick_story(session)
+    def get_story(
+        self, session: str = DEFAULT_SESSION, difficulty: str | None = None
+    ) -> tuple[str, str] | None:
+        """为指定会话取一道题。
+
+        Args:
+            session: 会话标识，使用记录按它分桶。
+            difficulty: 期望的题目难度；题库里没有这个字段时忽略。
+
+        Returns:
+            ``(puzzle, answer)``，取不到时返回 None。
+        """
+        return self.pick_story(session, difficulty)
 
     def get_storage_info(self, session: str | None = None) -> dict:
         """获取网络题库信息"""
@@ -633,9 +677,19 @@ class LocalSoupaiStorage(ThreadSafeStoryStorage):
             logger.info(f"添加新故事到存储库，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
-        """为指定会话取一道本地题"""
-        return self.pick_story(session)
+    def get_story(
+        self, session: str = DEFAULT_SESSION, difficulty: str | None = None
+    ) -> tuple[str, str] | None:
+        """为指定会话取一道本地题。
+
+        Args:
+            session: 会话标识，使用记录按它分桶。
+            difficulty: 期望的题目难度；题库里没有这个字段时忽略。
+
+        Returns:
+            ``(puzzle, answer)``，取不到时返回 None。
+        """
+        return self.pick_story(session, difficulty)
 
     def get_storage_info(self, session: str | None = None) -> dict:
         """获取存储库信息"""
@@ -731,9 +785,19 @@ class CustomSoupaiStorage(ThreadSafeStoryStorage):
             logger.info(f"添加新自定义海龟汤故事，当前存储库大小: {len(self.stories)}")
             return True
 
-    def get_story(self, session: str = DEFAULT_SESSION) -> tuple[str, str] | None:
-        """为指定会话取一道自定义题"""
-        return self.pick_story(session)
+    def get_story(
+        self, session: str = DEFAULT_SESSION, difficulty: str | None = None
+    ) -> tuple[str, str] | None:
+        """为指定会话取一道自定义题。
+
+        Args:
+            session: 会话标识，使用记录按它分桶。
+            difficulty: 期望的题目难度；题库里没有这个字段时忽略。
+
+        Returns:
+            ``(puzzle, answer)``，取不到时返回 None。
+        """
+        return self.pick_story(session, difficulty)
 
     def get_storage_info(self, session: str | None = None) -> dict:
         """获取自定义存储库信息"""
@@ -2611,7 +2675,11 @@ class SoupaiPlugin(Star):
             # 出过的题按会话记录，不同群、私聊各自独立
             session = event.unified_msg_origin
 
-            # 根据解析的参数获取故事
+            # 根据解析的参数获取故事。群里的难度设置既决定次数与达标线，
+            # 也决定抽到多难的题：说「困难」却抽到一眼看穿的题，难度就成了空话。
+            story_difficulty = self._story_difficulty(
+                self.group_difficulty.get(group_id, "普通")
+            )
             if puzzle_index is not None:
                 # 指定了题号，从特定题库获取
                 story = await self.get_story_by_index(
@@ -2627,7 +2695,7 @@ class SoupaiPlugin(Star):
                 if source_type == "current":
                     # 使用配置的策略获取随机故事
                     story = await self.get_story_by_strategy(
-                        self.puzzle_source_strategy, session
+                        self.puzzle_source_strategy, session, story_difficulty
                     )
                 else:
                     # 从指定题库获取随机故事
@@ -2637,7 +2705,7 @@ class SoupaiPlugin(Star):
                             "题库类型参数错误，请使用 network/local/custom"
                         )
                         return
-                    story = storage.get_story(session)
+                    story = storage.get_story(session, story_difficulty)
 
             if not story:
                 yield event.plain_result("获取谜题失败，请重试")
@@ -3072,6 +3140,27 @@ class SoupaiPlugin(Star):
     # 普通难度时回落到这个值，而不是抛 KeyError 把整局游戏带崩。
     _FALLBACK_PASS_SCORE = 70
 
+    # 群里的难度档位 -> 题库里的题目难度。题目只有 easy/medium/hard 三档，
+    # 「简单」和「666开挂了」都映射到两端，因为题目本身没有更细的分级。
+    _DIFFICULTY_TO_STORY = {
+        "简单": "easy",
+        "普通": "medium",
+        "困难": "hard",
+        "666开挂了": "hard",
+    }
+
+    @classmethod
+    def _story_difficulty(cls, group_difficulty: str) -> str | None:
+        """把群难度档位换算成题库里的题目难度。
+
+        Args:
+            group_difficulty: ``/汤难度`` 设置的档位名。
+
+        Returns:
+            题库里的难度值，未知档位返回 None（表示不限难度）。
+        """
+        return cls._DIFFICULTY_TO_STORY.get(group_difficulty)
+
     def _default_pass_score(self) -> int:
         """没有对局上下文时的达标线，取普通难度。
 
@@ -3419,9 +3508,18 @@ class SoupaiPlugin(Star):
         }.get(source)
 
     async def get_story_by_strategy(
-        self, strategy: str, session: str = DEFAULT_SESSION
+        self,
+        strategy: str,
+        session: str = DEFAULT_SESSION,
+        difficulty: str | None = None,
     ) -> tuple[str, str] | None:
-        """按策略为指定会话取题，三个题库都取不到时让 LLM 现场生成。"""
+        """按策略为指定会话取题，三个题库都取不到时让 LLM 现场生成。
+
+        Args:
+            strategy: 来源策略名，``random`` 表示随机挑一个题库。
+            session: 会话标识，使用记录按它分桶。
+            difficulty: 期望的题目难度，传给各题库的取题逻辑。
+        """
         self._ensure_story_storages()
 
         if strategy == "random":
@@ -3431,7 +3529,7 @@ class SoupaiPlugin(Star):
             return None
 
         for source in order:
-            story = self._storage_of(source).get_story(session)
+            story = self._storage_of(source).get_story(session, difficulty)
             if story:
                 return story
         story = await self.generate_and_store_story(umo=session)

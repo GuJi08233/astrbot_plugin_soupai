@@ -127,6 +127,11 @@ body {
 }
 .tag-used { background: var(--used-bg); color: var(--used); border-color: transparent; }
 .tag-muted { opacity: .7; }
+.tag-diff-easy { background: var(--ok); color: var(--surface); border-color: transparent; }
+.tag-diff-medium { background: var(--accent); color: var(--surface); border-color: transparent; }
+.tag-diff-hard { background: var(--danger); color: #fff; border-color: transparent; }
+.tag-category { opacity: .85; }
+.story-title { margin: 0 0 4px; font-weight: 600; }
 .tag-live { background: var(--ok); color: var(--surface); border-color: transparent; }
 .tag-ready { color: var(--ok); }
 .tag-stale { color: var(--used); background: var(--used-bg); }

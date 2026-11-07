@@ -131,6 +131,45 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Private twist", str(result))
         self.catalog.get_annotation.assert_not_called()
 
+    async def test_list_exposes_title_category_and_difficulty(self):
+        """标题和难度用于列表展示与筛选，本身不含汤底信息。"""
+        self.storage.stories[0].update(
+            title="灯塔熄灭之后", category="本格", difficulty="easy"
+        )
+
+        result = await self.api.stories()
+        item = result["data"]["items"][0]
+
+        self.assertEqual(item["title"], "灯塔熄灭之后")
+        self.assertEqual(item["category"], "本格")
+        self.assertEqual(item["difficulty"], "easy")
+
+    async def test_difficulty_filter_narrows_the_list(self):
+        self.storage.stories.append(
+            {
+                "id": "two",
+                "puzzle": "Second puzzle",
+                "answer": "Hidden answer two",
+                "difficulty": "hard",
+            }
+        )
+        self.storage.stories[0]["difficulty"] = "easy"
+
+        self.request.query = {"source": "network", "difficulty": "hard"}
+        result = await self.api.stories()
+
+        ids = [item["id"] for item in result["data"]["items"]]
+        self.assertEqual(ids, ["two"])
+
+    async def test_unknown_difficulty_value_does_not_filter(self):
+        """参数写错时应当返回全部，而不是返回空列表让页面以为题库空了。"""
+        self.storage.stories[0]["difficulty"] = "easy"
+        self.request.query = {"source": "network", "difficulty": "impossible"}
+
+        result = await self.api.stories()
+
+        self.assertEqual(result["data"]["total"], 1)
+
     async def test_annotation_details_require_a_separate_request(self):
         self.request.query = {"source": "network", "id": "one"}
         annotation = {"twist": "Explicitly requested detail"}

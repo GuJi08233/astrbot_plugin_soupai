@@ -210,6 +210,10 @@ class SoupaiWebApi:
 
         keyword = (request.query.get("q") or "").strip()
         session = request.query.get("session") or None
+        # 难度筛选只认题库里实际存在的三档，其余值当作不筛选
+        difficulty = (request.query.get("difficulty") or "").strip()
+        if difficulty not in ("easy", "medium", "hard"):
+            difficulty = ""
         # 搜索汤底会在列表页泄底，所以默认只搜汤面；要搜汤底得显式打开
         search_answer = (request.query.get("search_answer") or "") == "1"
         try:
@@ -223,6 +227,8 @@ class SoupaiWebApi:
         for index, story in enumerate(storage.stories):
             puzzle = story.get("puzzle", "")
             answer = story.get("answer", "")
+            if difficulty and story.get("difficulty") != difficulty:
+                continue
             if keyword:
                 haystack = puzzle + (answer if search_answer else "")
                 if keyword.lower() not in haystack.lower():
@@ -232,6 +238,9 @@ class SoupaiWebApi:
                 {
                     "id": sid,
                     "index": index,
+                    "title": story.get("title", ""),
+                    "category": story.get("category", ""),
+                    "difficulty": story.get("difficulty", ""),
                     "puzzle": puzzle,
                     "answer_preview_len": len(answer),
                     "hidden": sid in storage.hidden_ids,
