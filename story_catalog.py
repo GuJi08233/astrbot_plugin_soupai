@@ -31,6 +31,7 @@ class StoryCatalog:
         self._lock = threading.RLock()
         self._annotations: dict[str, dict] = {}
         self._embeddings: dict[str, dict] = {}
+        self._hints: dict[str, dict] = {}
         if not self.path.exists():
             return
         try:
@@ -65,6 +66,26 @@ class StoryCatalog:
                 for key, value in embeddings.items()
                 if isinstance(key, str) and isinstance(value, dict)
             }
+            # 预置提示是后来加的集合，旧缓存文件里没有这个键，缺省即可
+            hints = data.get("hints", {})
+            if not isinstance(hints, dict):
+                raise ValueError("Invalid hint collection")
+            for key, record in hints.items():
+                try:
+                    if (
+                        not isinstance(key, str)
+                        or key.split(":", 1)[0] not in self.SOURCES
+                        or not isinstance(record, dict)
+                        or not isinstance(record.get("content_hash"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", record["content_hash"])
+                    ):
+                        raise ValueError("Invalid hint record")
+                    self._hints[key] = {
+                        "content_hash": record["content_hash"],
+                        "hints": self._validate_hints(record.get("hints")),
+                    }
+                except ValueError as exc:
+                    logger.warning(f"Skipping invalid story hints: {exc}")
         except (OSError, ValueError, TypeError) as exc:
             logger.warning(f"Could not load story catalog cache: {exc}")
 
@@ -98,6 +119,31 @@ class StoryCatalog:
             if not char.isspace()
             and unicodedata.category(char)[0] not in {"P", "Z", "C"}
         )
+
+    @staticmethod
+    def _validate_hints(value) -> list[str]:
+        """Validate pre-written hints that ship with one story version.
+
+        提示是逐条解锁的：第一条给出方向，后面的逐级收紧。条数固定为 1-3，
+        与参考实现一致——再多就不是提示，而是复述汤底了。
+
+        Args:
+            value: The hint list from a model response or the cache file.
+
+        Returns:
+            Whitespace-trimmed hints in unlock order.
+
+        Raises:
+            ValueError: The list is missing, too long, or has an empty entry.
+        """
+        if not isinstance(value, list) or not 1 <= len(value) <= 3:
+            raise ValueError("提示必须包含 1 至 3 条")
+        if any(
+            not isinstance(item, str) or not 1 <= len(item.strip()) <= 200
+            for item in value
+        ):
+            raise ValueError("每条提示必须是 1 至 200 字的文本")
+        return [item.strip() for item in value]
 
     @staticmethod
     def _validate_annotation(value) -> dict:
@@ -148,6 +194,7 @@ class StoryCatalog:
                         "version": 1,
                         "annotations": self._annotations,
                         "embeddings": self._embeddings,
+                        "hints": self._hints,
                     },
                     stream,
                     ensure_ascii=False,
@@ -283,13 +330,113 @@ class StoryCatalog:
         key = f"{source}:{story_id}"
         with self._lock:
             previous = self._annotations.pop(key, None)
-            if previous is None:
+            previous_hints = self._hints.pop(key, None)
+            if previous is None and previous_hints is None:
                 return
             try:
                 self._save()
             except ValueError:
-                self._annotations[key] = previous
+                if previous is not None:
+                    self._annotations[key] = previous
+                if previous_hints is not None:
+                    self._hints[key] = previous_hints
                 raise
+
+    def hints_for(
+        self, source: str, story_id: str, puzzle: str, answer: str
+    ) -> list[str] | None:
+        """Return the pre-written hints for one story version.
+
+        提示和标注一样按内容哈希失效：题目被编辑后，旧的预置提示可能已经
+        指向被删掉的细节，必须重新生成。
+
+        Args:
+            source: The source library name.
+            story_id: Stable story identifier.
+            puzzle: Current puzzle text.
+            answer: Current solution text.
+
+        Returns:
+            Hints in unlock order, or None when absent or outdated.
+        """
+        with self._lock:
+            record = self._hints.get(f"{source}:{story_id}")
+            if record and record["content_hash"] == self._content_hash(puzzle, answer):
+                return list(record["hints"])
+            return None
+
+    def remember_hints(
+        self, source: str, story_id: str, puzzle: str, answer: str, hints: list[str]
+    ) -> None:
+        """Persist pre-written hints for the given story version.
+
+        Args:
+            source: The source library name.
+            story_id: Stable story identifier.
+            puzzle: Accepted puzzle text.
+            answer: Accepted solution text.
+            hints: Validated hints in unlock order.
+
+        Raises:
+            ValueError: Hints are invalid or cannot be persisted.
+        """
+        if source not in self.SOURCES or not str(story_id).strip():
+            raise ValueError("无法保存提示：题库或题目 ID 无效")
+        record = {
+            "content_hash": self._content_hash(puzzle, answer),
+            "hints": self._validate_hints(hints),
+        }
+        key = f"{source}:{story_id}"
+        with self._lock:
+            previous = self._hints.get(key)
+            self._hints[key] = record
+            try:
+                self._save()
+            except ValueError:
+                if previous is None:
+                    self._hints.pop(key, None)
+                else:
+                    self._hints[key] = previous
+                raise
+
+    async def generate_hints(
+        self, puzzle: str, answer: str, umo: str | None = None
+    ) -> list[str]:
+        """Write the unlock-order hints for one story in a single model call.
+
+        预置提示是结构性防泄露：内容在入库时定下、可人工过目，玩家拿到的是
+        已经审过的句子，而不是每次现生成、只能靠提示词约束的东西。
+
+        Args:
+            puzzle: Public puzzle text.
+            answer: Complete hidden story.
+            umo: Session origin for provider resolution.
+
+        Returns:
+            Two to three hints, narrowing from direction to key mechanism.
+
+        Raises:
+            ValueError: The model fails or returns invalid hints.
+        """
+        prompt = (
+            "给下面这道海龟汤写 2-3 条由浅入深的提示，玩家按顺序解锁。\n"
+            "第 1 条只指出该关注哪一类事情（对象/身份、关系、动机、时间、地点、"
+            "证据、步骤、先后、条件、规则、误解），不指向谜底所在的具体点；\n"
+            "第 2、3 条逐步收紧到关键机制，但仍不得直接说出反转或汤底的具体内容。\n"
+            "每条 1-200 字，只输出一句方向性的话，格式为「关注【维度】：动词+对象」。"
+            "不得复述汤面，不得确认或否定任何具体猜测，不得出现汤底独有的关键物件或机制。\n"
+            "只输出一个字段：hints（字符串数组，2 至 3 项）。\n"
+            "故事数据：\n"
+            + json.dumps({"puzzle": puzzle, "answer": answer}, ensure_ascii=False)
+        )
+        result = await self._llm_json(prompt, "hints", umo)
+        try:
+            if not isinstance(result, dict) or set(result) != {"hints"}:
+                raise ValueError("提示结果需要且只包含 hints 字段")
+            return self._validate_hints(result["hints"])
+        except ValueError as exc:
+            logger.warning(f"Story hint schema validation failed: {exc}")
+            raise ValueError(f"预置提示格式无效：{exc}") from exc
 
     async def _llm_json(self, prompt: str, purpose: str, umo: str | None) -> dict:
         """Run a bounded structured model request and reject ambiguous output.
@@ -305,7 +452,12 @@ class StoryCatalog:
         Raises:
             ValueError: The model is unavailable, fails or returns invalid JSON.
         """
-        label = "题库标注" if purpose == "annotation" else "重复题复核"
+        label = {
+            "annotation": "题库标注",
+            "deduplication": "重复题复核",
+            "moderation": "内容审核",
+            "hints": "预置提示生成",
+        }.get(purpose, "题库请求")
         try:
             provider_id = ""
             for key in (
@@ -387,6 +539,51 @@ class StoryCatalog:
         except ValueError as exc:
             logger.warning(f"Story annotation schema validation failed: {exc}")
             raise ValueError(f"LLM 标注格式无效：{exc}") from exc
+
+    async def moderate(self, puzzle: str, answer: str, umo: str | None = None) -> dict:
+        """Screen a new story for sexual or political content before admission.
+
+        A group chat may have minors in it, and both user-submitted and
+        model-generated stories reach a group without anyone reading them
+        first. Ordinary suspense, death, crime and police work are expected
+        in this genre and must not be flagged.
+
+        Args:
+            puzzle: Public puzzle text.
+            answer: Complete hidden story.
+            umo: Session origin for provider resolution.
+
+        Returns:
+            ``{"passed": bool, "reason": str}``; the reason describes the
+            category of the problem, never the story content itself.
+
+        Raises:
+            ValueError: The model fails or returns an unusable verdict, so
+                admission cannot safely proceed.
+        """
+        prompt = (
+            "审核下面这道海龟汤是否可以进入群聊题库。只检查两类内容：色情，"
+            "以及政治（政治人物、政治事件、政治宣传、政策争议）。标题、汤面、"
+            "汤底任一处涉及就判不通过。普通的悬疑、死亡、犯罪、恐怖和警察办案"
+            "属于海龟汤的正常题材，不因此判为不通过。\n"
+            "只输出两个字段：passed（布尔值），reason（1-80 字，说明触及了哪一类，"
+            "不得复述或概括故事内容）。\n"
+            "故事数据：\n"
+            + json.dumps({"puzzle": puzzle, "answer": answer}, ensure_ascii=False)
+        )
+        result = await self._llm_json(prompt, "moderation", umo)
+        try:
+            if not isinstance(result, dict) or set(result) != {"passed", "reason"}:
+                raise ValueError("审核结果需要且只包含 passed 与 reason 两个字段")
+            passed, reason = result["passed"], result["reason"]
+            if not isinstance(passed, bool):
+                raise ValueError("passed 必须是布尔值")
+            if not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 80:
+                raise ValueError("reason 需要是 1-80 字的文本")
+            return {"passed": passed, "reason": reason.strip()}
+        except ValueError as exc:
+            logger.warning(f"Story moderation schema validation failed: {exc}")
+            raise ValueError(f"内容审核结果格式无效，题目尚未入库：{exc}") from exc
 
     async def annotate(
         self,

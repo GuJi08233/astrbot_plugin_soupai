@@ -10,8 +10,9 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 
 - **Game and admission flow**: `main.py` owns the plugin, game state, generation,
   model selection, and serialized `save_story_checked()` writes
-- **Story catalog**: `story_catalog.py` owns sidecar annotations, content-version
-  invalidation, cross-library duplicate checks, embedding caches, and reranking
+- **Story catalog**: `story_catalog.py` owns sidecar annotations, preset hints,
+  content moderation, content-version invalidation, cross-library duplicate
+  checks, embedding caches, and reranking
 - **Web management**: `webui.py` owns API routes and the explicit annotation job;
   `pages/dashboard/` is the static management frontend
 - **AstrBot framework**: Built on AstrBot >= 4.16, < 5
@@ -27,7 +28,9 @@ This is an AstrBot plugin for a "Sea Turtle Soup" (海龟汤) reasoning game. It
 - **Configuration**: `_conf_schema.json` defines plugin settings
 - **Metadata**: `metadata.yaml` for plugin registration
 - **Derived story data**: `story_catalog.json` in the plugin data directory;
-  keep annotations and embedding vectors out of the shipped puzzle files
+  keep annotations, hints and embedding vectors out of the shipped puzzle files.
+  The `hints` collection was added later, so loading must tolerate its absence
+  in files written by earlier versions.
 
 ## Development Commands
 
@@ -83,6 +86,33 @@ This is an AstrBot plugin, so development involves:
   invent values absent from the response or older question records. Keep
   `_JUDGE_CRITERIA` in step with the wording in the LLM prompt: both paths must
   classify the same way, or flipping the setting changes how the game feels.
+  `_jev_post()` owns transport: one retry within a 45-second deadline for
+  network/5xx/429/timeout, immediate failure for 401/403, and a 30-second
+  pause after five consecutive request failures. Only request-level failures
+  count toward the pause — an `invalid_response` means the service is alive
+  and must not trip it. `JEV_PROMPT_VERSION` must change whenever `_JUDGE_CRITERIA`
+  or the state shape changes; every record keeps it so old rounds stay
+  interpretable under the rules they were judged by.
+- **Compound questions route to the LLM, and the rule is data-driven.**
+  `_is_compound_question()` catches sentences carrying several independent
+  claims, because the fast model treats "the last claim is false" as "the
+  whole thing is false" and answers 否 where the gold label is 是也不是. On the
+  429-question gold set the previous regex caught 1.4% of them; splitting on
+  commas and requiring each clause to stand alone raises it to 10.5% (43
+  questions), and those 43 score only 0.651 when handed to the decision model
+  versus far better through the judge LLM. Confirmation tails (对吗、是吧) and
+  subordinate clauses (因为、所以) are not independent claims; without that
+  filter, single propositions such as 「他不在家，是因为加班吗」 get misrouted.
+  Re-measure with `tests/eval_jev_accuracy.py` before changing the rule —
+  the routing still pays off on the newest model, but that was checked, not
+  assumed.
+- **Record the model version the response reports, not the configured alias.**
+  `jev-latest` resolves to a concrete version (1.13.0, 1.14.0, …) and upstream
+  swaps it silently. Measured on the same 429 questions, 1.14.0 corrects 0.940
+  → 0.967 on the production subset and drops p50 latency 887 ms → 280 ms, so
+  these numbers move with the alias, not with our code. `result["model"]` and
+  `result["usage"]` come from the response body; never fabricate them when the
+  field is absent, and keep the configured name as the fallback.
 - **Stopping propagation**: `event.stop_event()`. There is no `event.block()`.
 - **Config schema**: `_conf_schema.json` is rendered by the dashboard's
   `ConfigItemRenderer`. Five chat-provider fields carry `"_special":
@@ -242,6 +272,11 @@ Annotation UI stays inside the existing stories tab:
   status only; tags, summary, causality, and twist can reveal the answer.
 - `POST story/annotate` takes `{source, id, force?}` after an explicit action.
   Opening either the list or the detail view must never start this request.
+- `GET story/hints?source=...&id=...` returns `{hints: string[]}` (empty when
+  none exist) and never generates. `POST story/hints/generate` takes
+  `{source, id}`, generates and persists a fresh set, and is the only way to
+  spend a model call on hints. The detail view fetches both in parallel and
+  degrades independently — a hint failure must not blank out the annotation.
 - `GET annotation/preview?source=...&force=0|1` returns `{total, ready, pending}`
   without model calls. Source is `network`, `local`, `custom`, or `all`; forced
   previews count all entries as pending.
@@ -279,6 +314,20 @@ add an automatic full-library annotation task during plugin initialization.
   round's difficulty, then 普通. Per-dimension scores stay out of chat —
   telling a player the 反转 line scored 20 tells them there is a twist they
   have not found.
+- **Preset hints come first; dynamic generation is the fallback.**
+  `StoryCatalog.generate_hints()` writes 2-3 unlock-ordered hints per story
+  version and caches them in `story_catalog.json`; `_preset_hint()` looks them
+  up by puzzle+answer because a round does not store its bank or story id
+  (dedup guarantees the pair is unique across banks). The first `/提示` of a
+  story generates the whole set once; every later hint, in any round, is a
+  cache read. This is the structural answer to hint leakage: content is
+  written once and can be reviewed, instead of being constrained by prompt
+  wording on every call. Any failure falls back to dynamic generation — a
+  broken cache must never cost a player their hint. Editing a story invalidates
+  its hints through the same content hash as annotations; `forget()` must drop
+  both collections or a deleted story leaves an orphaned hint set behind.
+  The unlock index is the round's `hint_count`, so preset sets shorter than
+  the difficulty's `hint_limit` fall through to dynamic hints past the end.
 - **Hints steer by how the player is doing, and `allow_list` is word-level.**
   `_describe_recent_progress()` computes the progress line in code — the model
   is bad at counting verdicts out of a transcript. Six or more tenths of the
@@ -362,4 +411,20 @@ add an automatic full-library annotation task during plugin initialization.
   automatic generation, and manual generation all use `save_story_checked()`.
   A model failure or malformed duplicate review is not a successful check.
   Preserve the async check-and-write boundary when adding another entry point.
+- **Moderation runs before deduplication, inside the write lock.**
+  `save_story_checked()` calls `StoryCatalog.moderate()` first because a
+  rejected story must not pay for an annotation and duplicate review. Only
+  sexual and political content are rejected; suspense, death, crime and police
+  work are normal in this genre and a false positive here silently blocks a
+  legitimate puzzle. A malformed moderation response is a failed admission,
+  never a pass. `content_moderation_enabled` defaults to on: group chats can
+  have minors in them and both `/添加海龟汤` and auto-generated stories reach
+  players with nobody having read them.
+- **Question context is shared by the group, not scoped to the asker.**
+  `judge_question()` receives the round's last three `qa_history` entries.
+  Everyone in a group is working the same puzzle, so a pronoun in player B's
+  question usually points at whoever player A established a turn earlier;
+  scoping by player id turned answerable follow-ups into clarification
+  requests. The `_player_qa` map is gone — do not reintroduce per-player
+  transcripts for judging.
 - Format with `ruff check --fix && ruff format` before committing.

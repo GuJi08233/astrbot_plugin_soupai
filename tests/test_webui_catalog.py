@@ -53,6 +53,9 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
             get_annotation=Mock(return_value=None),
             annotate=AsyncMock(return_value={"theme": "test"}),
             forget=Mock(),
+            hints_for=Mock(return_value=None),
+            remember_hints=Mock(),
+            generate_hints=AsyncMock(return_value=["关注【地点】：确认照明条件"]),
         )
         self.storage = SimpleNamespace(
             stories=[dict(self.entries[0])],
@@ -134,6 +137,50 @@ class CatalogApiTests(unittest.IsolatedAsyncioTestCase):
         self.catalog.get_annotation.return_value = annotation
         result = await self.api.story_annotation()
         self.assertEqual(result["data"]["annotation"], annotation)
+
+    async def test_hint_reads_never_generate(self):
+        """只看详情不该花模型调用；生成必须由用户另外点一次。"""
+        self.request.query = {"source": "network", "id": "one"}
+        self.catalog.hints_for.return_value = ["关注【地点】：确认照明条件"]
+
+        result = await self.api.story_hints()
+
+        self.assertEqual(result["data"]["hints"], ["关注【地点】：确认照明条件"])
+        self.catalog.generate_hints.assert_not_awaited()
+
+    async def test_missing_hints_report_an_empty_list(self):
+        self.request.query = {"source": "network", "id": "one"}
+        self.catalog.hints_for.return_value = None
+
+        result = await self.api.story_hints()
+
+        self.assertEqual(result["data"]["hints"], [])
+
+    async def test_generating_hints_persists_them_against_the_story_version(self):
+        self.request.json.return_value = {"source": "network", "id": "one"}
+
+        result = await self.api.story_hints_generate()
+
+        self.assertEqual(result["data"]["hints"], ["关注【地点】：确认照明条件"])
+        self.catalog.generate_hints.assert_awaited_once_with(
+            "First puzzle", "Hidden answer one"
+        )
+        self.catalog.remember_hints.assert_called_once_with(
+            "network",
+            "one",
+            "First puzzle",
+            "Hidden answer one",
+            ["关注【地点】：确认照明条件"],
+        )
+
+    async def test_hint_generation_failure_is_reported_not_swallowed(self):
+        self.request.json.return_value = {"source": "network", "id": "one"}
+        self.catalog.generate_hints.side_effect = ValueError("Synthetic model failure")
+
+        result = await self.api.story_hints_generate()
+
+        self.assertEqual(result["status"], "error")
+        self.catalog.remember_hints.assert_not_called()
 
     async def test_batch_skips_ready_records_and_tracks_failures(self):
         self.catalog.annotation_status.side_effect = ["ready", "missing"]

@@ -243,7 +243,8 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(game["question_count"], 1)
         self.assertEqual(self.plugin._send_reply.call_args.args[1], "是")
 
-    async def test_question_context_is_per_player_and_only_retains_successes(self):
+    async def test_question_context_is_shared_by_the_whole_group(self):
+        """群聊是多人共同破题：B 问「他还活着吗」时，「他」通常是 A 上一轮确立的人。"""
         game, waiter = await self.start_round()
         for message in (
             "First question",
@@ -254,11 +255,17 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.SessionWaiter.trigger(
                 waiter.session_id, self.event(message)
             )
-        self.assertEqual(len(game["_player_qa"]["player-one"]), 3)
         other = self.event("Other player's question")
         other.get_sender_id = lambda: "player-two"
         await self.runtime.SessionWaiter.trigger(waiter.session_id, other)
-        self.assertEqual(self.plugin.judge_question.call_args.kwargs["qa_history"], [])
+        # 别的玩家提问时仍能看到前几问，指代才有对象可解析
+        self.assertEqual(
+            [
+                item["question"]
+                for item in self.plugin.judge_question.call_args.kwargs["qa_history"]
+            ],
+            ["Second question", "Third question", "Fourth question"],
+        )
         self.plugin.judge_question.return_value = (
             "请说明具体人物",
             {"engine": "unavailable"},
@@ -271,12 +278,13 @@ class GameSessionTests(unittest.IsolatedAsyncioTestCase):
                 item["question"]
                 for item in self.plugin.judge_question.call_args.kwargs["qa_history"]
             ],
-            ["Second question", "Third question", "Fourth question"],
+            ["Third question", "Fourth question", "Other player's question"],
         )
         self.assertEqual(game["question_count"], 5)
         self.assertEqual(len(game["qa_history"]), 5)
-        self.assertEqual(len(game["_player_qa"]["player-one"]), 3)
         self.assertNotIn("sender_id", game["qa_history"][0])
+        # 上下文是共享的，那个按玩家分的中间态不该再存在
+        self.assertNotIn("_player_qa", game)
 
     async def test_late_model_results_do_not_reply_to_or_end_a_new_round(self):
         for method, message, result in (

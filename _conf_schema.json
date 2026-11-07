@@ -52,6 +52,12 @@
     "hint": "开启后，新题入库前用 LLM 标注并复核相似题，可能额外调用模型；关闭后仍检查三个题库的相同汤面和汤底。显式批量标注需在题库页面启动。",
     "default": true
   },
+  "content_moderation_enabled": {
+    "description": "入库前进行内容审核",
+    "type": "bool",
+    "hint": "开启后，新增或编辑题目在入库前检查色情与政治内容，不通过则拒绝写入。群聊可能有未成年人在场，建议保持开启。审核与标注、查重共用同一个 LLM 服务商。",
+    "default": true
+  },
   "dedup_embedding_provider": {
     "description": "题库查重的嵌入服务商",
     "type": "string",
@@ -180,9 +186,9 @@
     }
   },
   "jev_model": {
-    "description": "Jev 模型名",
+    "description": "判定模型",
     "type": "string",
-    "hint": "默认 jev-latest。可填 jev-preview 或锁定具体版本如 jev-1.13.0。",
+    "hint": "默认 jev-latest（当前解析为 jev-1.14.0，429 条标注样本上生产子集准确率 0.967、p50 延迟 280ms）。也可填 subq-snap-1.1——同一接口的轻量判定模型，准确率 0.959、p50 372ms，否定问句略强但多断言混问较弱。锁定具体版本可填 jev-1.14.0 这样的完整版本号。",
     "default": "jev-latest",
     "condition": {
       "judge_engine": "jev"

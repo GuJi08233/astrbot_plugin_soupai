@@ -618,6 +618,59 @@ class CatalogTests(unittest.IsolatedAsyncioTestCase):
 
         self.llm.text_chat.assert_awaited_once()
 
+    async def test_preset_hints_are_cached_and_survive_a_reload(self):
+        """一次生成全部提示，之后各次解锁都读缓存，不必再花模型调用。"""
+        self._put()
+        self._set_llm_responses(
+            {"hints": ["关注【地点】：确认照明条件", "关注【动机】：谁需要黑暗"]}
+        )
+
+        hints = await self.catalog.generate_hints("题面", "汤底")
+        self.catalog.remember_hints("network", "existing", "题面", "汤底", hints)
+
+        self.assertEqual(len(hints), 2)
+        self.assertEqual(
+            self.catalog.hints_for("network", "existing", "题面", "汤底"), hints
+        )
+        # 重新加载侧车文件后仍然可用，说明确实落盘了
+        reloaded = self.catalog_class(self.plugin)
+        self.assertEqual(
+            reloaded.hints_for("network", "existing", "题面", "汤底"), hints
+        )
+
+    async def test_edited_story_invalidates_its_preset_hints(self):
+        """题目改过之后，旧提示可能指向被删掉的细节，必须重新生成。"""
+        self.catalog.remember_hints(
+            "network", "existing", "旧题面", "旧汤底", ["旧提示"]
+        )
+
+        self.assertIsNone(
+            self.catalog.hints_for("network", "existing", "新题面", "旧汤底")
+        )
+
+    async def test_forgetting_a_story_also_drops_its_hints(self):
+        self.catalog.remember_hints("network", "existing", "题面", "汤底", ["提示"])
+        self.catalog.forget("network", "existing")
+
+        self.assertIsNone(self.catalog.hints_for("network", "existing", "题面", "汤底"))
+        reloaded = self.catalog_class(self.plugin)
+        self.assertIsNone(reloaded.hints_for("network", "existing", "题面", "汤底"))
+
+    async def test_invalid_hint_payloads_are_rejected(self):
+        self._put()
+        for payload in (
+            {"hints": []},
+            {"hints": ["一", "二", "三", "四"]},
+            {"hints": [""]},
+            {"hints": ["提示" * 201]},
+            {"hints": "不是数组"},
+            {"hints": ["好的"], "extra": "多余字段"},
+        ):
+            with self.subTest(payload=payload):
+                self._set_llm_responses(payload)
+                with self.assertRaises(ValueError):
+                    await self.catalog.generate_hints("题面", "汤底")
+
 
 if __name__ == "__main__":
     unittest.main()

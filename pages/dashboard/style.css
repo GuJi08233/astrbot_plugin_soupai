@@ -157,6 +157,10 @@ body {
 .judge-probabilities { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 8px 0; }
 .judge-probability { padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
 .judge-probability.is-choice { border-color: var(--accent); }
+.judge-diagnostics { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 8px 0 0; padding-top: 8px; border-top: 1px dashed var(--border); }
+.judge-diagnostic { display: flex; gap: 6px; font-size: 12px; }
+.judge-diagnostic dt { color: var(--muted); }
+.judge-diagnostic dd { margin: 0; font-variant-numeric: tabular-nums; }
 .judge-probability dt { color: var(--muted); font-size: 12px; }
 .judge-probability dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
 
@@ -222,6 +226,8 @@ body {
 .annotation-detail h4 { margin: 16px 0 4px; }
 .annotation-detail p { margin: 4px 0; }
 .annotation-detail ol { margin: 4px 0; padding-left: 22px; }
+.hint-block { margin-top: 20px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.hint-block h4:first-child { margin-top: 8px; }
 .annotation-job { border-top: 1px solid var(--border); padding-top: 8px; }
 .annotation-job progress { width: 100%; accent-color: var(--accent); }
 #annotationErrorList { max-height: 180px; overflow-y: auto; overflow-wrap: anywhere; padding-left: 22px; }

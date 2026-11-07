@@ -67,6 +67,13 @@ class SoupaiWebApi:
                 "查看单题标注（含汤底信息）",
             ),
             ("/story/annotate", self.story_annotate, ["POST"], "标注单题"),
+            ("/story/hints", self.story_hints, ["GET"], "查看单题预置提示"),
+            (
+                "/story/hints/generate",
+                self.story_hints_generate,
+                ["POST"],
+                "生成单题预置提示",
+            ),
             (
                 "/annotation/preview",
                 self.annotation_preview,
@@ -458,6 +465,39 @@ class SoupaiWebApi:
         except ValueError as exc:
             return error_response(str(exc))
         return _ok({"status": "ready", "annotation": annotation})
+
+    async def story_hints(self):
+        """Return the pre-written hints for one story, if any.
+
+        和标注一样只在显式打开详情时才请求：提示本身不含汤底，但会指出这道题
+        该往哪个方向想，列表里铺开会直接毁掉别人的游戏体验。
+        """
+        source, sid = request.query.get("source") or "", request.query.get("id") or ""
+        _, _, story = self._resolve(source, sid)
+        if story is None:
+            return error_response("题目不存在")
+        hints = self.plugin.story_catalog.hints_for(
+            source, sid, story["puzzle"], story["answer"]
+        )
+        return _ok({"hints": hints or []})
+
+    async def story_hints_generate(self):
+        """Generate or regenerate the preset hints for one explicitly chosen story."""
+        data = await self._payload()
+        source, sid = str(data.get("source") or ""), str(data.get("id") or "")
+        _, _, story = self._resolve(source, sid)
+        if story is None:
+            return error_response("题目不存在")
+        try:
+            hints = await self.plugin.story_catalog.generate_hints(
+                story["puzzle"], story["answer"]
+            )
+            self.plugin.story_catalog.remember_hints(
+                source, sid, story["puzzle"], story["answer"], hints
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
+        return _ok({"hints": hints})
 
     async def annotation_preview(self):
         """Count the selected stories without invoking any model."""

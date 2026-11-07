@@ -543,6 +543,24 @@
             probabilities.appendChild(row);
           });
           metrics.appendChild(probabilities);
+          // 诊断字段：出问题时能分清是模型换了、提示词改了还是网络慢。
+          // 旧记录没有这些键，逐项判断后跳过，不显示空行。
+          const diagnostics = [
+            ['模型', jev?.model],
+            ['提示词版本', jev?.prompt_version],
+            ['尝试次数', jev?.attempts],
+            ['耗时', typeof jev?.latency_ms === 'number' ? `${jev.latency_ms} ms` : null],
+          ].filter(([, value]) => value != null && value !== '');
+          if (diagnostics.length) {
+            const list = el('dl', 'judge-diagnostics');
+            diagnostics.forEach(([name, value]) => {
+              const row = el('div', 'judge-diagnostic');
+              row.appendChild(el('dt', null, name));
+              row.appendChild(el('dd', null, String(value)));
+              list.appendChild(row);
+            });
+            metrics.appendChild(list);
+          }
           if (!jev) {
             metrics.appendChild(el('p', 'judge-note muted',
               '旧记录未保存 Jev 原选项、四选项概率、采用门槛和回退原因。'));
@@ -913,17 +931,60 @@
     const content = $('#annotationDetailContent');
     content.replaceChildren(el('p', 'muted', '正在加载标注…'));
     $('#annotationDetailModal').hidden = false;
+    let hintsBox = null;
     try {
-      const data = await api.get('story/annotation', { source, id: item.id });
+      const [data, hintData] = await Promise.all([
+        api.get('story/annotation', { source, id: item.id }),
+        // 提示和标注分成两个请求：提示拿不到不该连累标注显示
+        api.get('story/hints', { source, id: item.id }).catch(() => ({ hints: [] })),
+      ]);
       if (version !== annotationDetailVersion) return;
+      hintsBox = el('div', 'hint-block');
+      hintsBox.appendChild(el('h4', null, '预置提示'));
+      const hints = hintData?.hints || [];
+      if (hints.length) {
+        const list = el('ol');
+        hints.forEach((text) => list.appendChild(el('li', null, text)));
+        hintsBox.appendChild(list);
+        hintsBox.appendChild(el('p', 'muted', '按顺序解锁，玩家每次要提示时取一条。'));
+      } else {
+        hintsBox.appendChild(el('p', 'muted', '尚未生成，玩家第一次要提示时会自动生成。'));
+      }
+      const regen = el('button', 'btn btn-ghost', hints.length ? '重新生成提示' : '生成提示');
+      const regenError = el('p', 'error-text');
+      regenError.hidden = true;
+      regen.addEventListener('click', async () => {
+        regen.disabled = true;
+        regenError.hidden = true;
+        try {
+          const result = await api.post('story/hints/generate', { source, id: item.id }, 600000);
+          if (version !== annotationDetailVersion) return;
+          hintsBox.replaceChildren(el('h4', null, '预置提示'));
+          const fresh = el('ol');
+          result.hints.forEach((text) => fresh.appendChild(el('li', null, text)));
+          hintsBox.appendChild(fresh);
+          hintsBox.appendChild(el('p', 'muted', '按顺序解锁，玩家每次要提示时取一条。'));
+        } catch (err) {
+          if (version !== annotationDetailVersion) return;
+          regenError.textContent = `生成失败：${err.message || String(err)}`;
+          regenError.hidden = false;
+        } finally {
+          regen.disabled = false;
+        }
+      });
+      hintsBox.appendChild(regen);
+      hintsBox.appendChild(regenError);
+
       const annotation = data.annotation;
       content.replaceChildren();
       if (data.status === 'stale') {
         content.appendChild(el('p', 'note', '原标注已失效，请关闭后重新进行 LLM 标注。'));
+        content.appendChild(hintsBox);
         return;
       }
       if (!annotation) {
         content.appendChild(el('p', 'muted', '尚未标注。关闭后可点击“LLM 标注”；查看不会自动调用模型。'));
+        content.appendChild(hintsBox);
         return;
       }
       content.appendChild(el('h4', null, '题材'));
@@ -940,9 +1001,11 @@
       } else content.appendChild(el('p', null, '未提供'));
       content.appendChild(el('h4', null, '反转'));
       content.appendChild(el('p', null, annotation.twist || '未提供'));
+      content.appendChild(hintsBox);
     } catch (err) {
       if (version !== annotationDetailVersion) return;
       content.replaceChildren(el('p', 'error-text', `加载失败：${err.message || String(err)}`));
+      if (hintsBox) content.appendChild(hintsBox);
     }
   }
 

@@ -41,8 +41,12 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
             "warnings": [],
         }
         self.plugin.story_catalog = SimpleNamespace(
-            check=AsyncMock(return_value=self.report), forget=Mock(), remember=Mock()
+            check=AsyncMock(return_value=self.report),
+            forget=Mock(),
+            remember=Mock(),
+            moderate=AsyncMock(return_value={"passed": True, "reason": "无明显问题"}),
         )
+        self.plugin.content_moderation_enabled = True
         self.plugin.generate_llm_provider_id = "generator"
         self.provider = SimpleNamespace(
             text_chat=AsyncMock(
@@ -64,6 +68,10 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(saved["puzzle"], "新题面")
                 self.assertEqual(saved["answer"], "新汤底")
                 self.assertEqual(saved["check"], self.report)
+                self.assertEqual(
+                    saved["check"]["moderation"],
+                    {"passed": True, "reason": "无明显问题"},
+                )
                 self.plugin.story_catalog.check.assert_awaited_with(
                     "新题面", "新汤底", exclude=None, umo="test-session"
                 )
@@ -419,6 +427,40 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
         self.provider.text_chat.assert_not_awaited()
         self.plugin.story_catalog.check.assert_not_awaited()
         self.assertEqual(self.local.stories, [])
+
+    async def test_rejected_story_never_reaches_the_bank(self):
+        """群聊里可能有未成年人，没通过内容审核的题一道都不能入库。"""
+        self.plugin.story_catalog.moderate = AsyncMock(
+            return_value={"passed": False, "reason": "含有色情内容"}
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            await self.plugin.save_story_checked("custom", "新题面", "新汤底")
+
+        self.assertIn("内容审核", str(caught.exception))
+        self.assertEqual(self.custom.stories, [])
+        # 审核没通过就不该再花一次标注/查重的模型调用
+        self.plugin.story_catalog.check.assert_not_awaited()
+
+    async def test_moderation_can_be_switched_off(self):
+        self.plugin.content_moderation_enabled = False
+
+        await self.plugin.save_story_checked("custom", "新题面", "新汤底")
+
+        self.plugin.story_catalog.moderate.assert_not_awaited()
+        self.assertEqual(len(self.custom.stories), 1)
+
+    async def test_moderation_runs_before_the_duplicate_check(self):
+        """审核成本低于标注查重，先拦下来的题不必再生成标注。"""
+        self.plugin.story_catalog.moderate = AsyncMock(
+            return_value={"passed": False, "reason": "涉及政治人物"}
+        )
+
+        with self.assertRaises(ValueError):
+            await self.plugin.save_story_checked("custom", "新题面", "新汤底")
+
+        self.plugin.story_catalog.moderate.assert_awaited_once()
+        self.plugin.story_catalog.check.assert_not_awaited()
 
 
 if __name__ == "__main__":

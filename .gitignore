@@ -17,3 +17,4 @@ venv/
 
 # 离线评测产物（含谜题原文，不入库）
 tests/eval_results.json
+tests/eval_jev_results.json

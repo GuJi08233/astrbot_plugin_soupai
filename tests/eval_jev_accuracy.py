@@ -1,477 +1,703 @@
-"""Offline evaluation: Jev vs LLM judging accuracy on the shipped puzzle bank.
+"""Offline evaluation of question judging against a hand-labelled gold set.
 
-Reads AstrBot's cmd_config.json for the api.guji.uno relay key, then for a
-sample of (puzzle, question, gold verdict) triples calls:
+Loads the real ``main.py`` with AstrBot stubbed out (as the unit tests do), so
+the Jev payload, the judging rules and the question routing all come from the
+production code instead of a copy that can drift. Decision models are called
+through ``SoupaiPlugin._jev_choice`` (``/v1/systemone``); chat models go
+through ``judge_question`` in LLM mode with an OpenAI-compatible provider shim,
+which reproduces the production prompt and reply parsing.
 
-- Jev  /v1/systemone  (same payload shape as main.py `_jev_choice`)
-- LLM  /v1/chat/completions with step-3.7-flash (same prompt as `judge_question`)
+The gold set is ``tests/eval_jev_gold.jsonl``: one question per line, keyed by
+network-bank story id, labelled against the current ``_JUDGE_CRITERIA``. It is
+committed because it carries no puzzle answers — only story id, tag, the
+question itself and the expected verdict. By default each question carries the
+previous three questions of the same story as ``相关问答``, the way production
+passes the round's recent questions.
+Raw results go to ``tests/eval_jev_results.json``, which is gitignored because
+it contains puzzle answers.
 
-Reports accuracy, per-confidence-bin accuracy, threshold tradeoffs, and
-probability-distribution stats. Writes results to tests/eval_results.json.
+This is the regression gate for judging changes. Change ``_JUDGE_CRITERIA``,
+``_JUDGE_INSTRUCTIONS``, ``JEV_PROMPT_VERSION`` or ``_is_compound_question``
+and re-run it before shipping; bump the prompt version in the same commit, so
+records can still be read under the rules they were judged by.
 
-Usage:  python tests/eval_jev_accuracy.py [sample_size] [concurrency]
+Usage (from the plugin directory, in AstrBot's Python environment)::
+
+    GUJI_API_KEY=sk-... python tests/eval_jev_accuracy.py \\
+        --jev jev-latest decision-model-preview \\
+        --llm deepseek-v4.1-flash step-5-preview
+
+``--reuse PATH [PATH ...]`` takes model outputs from earlier results files for
+every question whose state (puzzle, answer, wording and history) is unchanged,
+and only queries what is missing; with everything cached it re-scores against
+the current gold labels without any API call. The API key is read from the
+environment only and is never written to disk.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import importlib.util
 import io
 import json
+import logging
+import math
 import os
-import random
-import re
 import sys
 import time
-
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from contextvars import ContextVar
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-ASTRBOT_ROOT = PLUGIN_DIR.parent.parent.parent
-CONFIG_PATH = ASTRBOT_ROOT / "data" / "cmd_config.json"
-RESULTS_PATH = Path(__file__).resolve().parent / "eval_results.json"
-
-JUDGE_CRITERIA = {
-    "是": "玩家命中关键事实或行为，且该信息能直接帮助接近真相。缺少部分细节可以忽略，只要不影响推理方向。",
-    "否": "与真相完全不符，或包含明显错误，会使玩家推理走向错误方向。",
-    "不重要": "与故事真相无关，或该信息无法推动推理进展。",
-    "是也不是": "命中部分事实，但因果关系不完整、或含有可能让玩家推理错误的成分。",
-}
-JEV_INSTRUCTIONS = "海龟汤推理游戏。请判断`玩家提问`的说法，相对于`真相`应当如何回答。"
-VALID = set(JUDGE_CRITERIA)
-
-QUESTION_KINDS = ["fact_yes", "fact_no", "irrelevant", "partial", "vague", "wrong_dir"]
-# how many questions of each kind per puzzle (before dedup)
-PER_KIND = 2
+GOLD_PATH = Path(__file__).resolve().parent / "eval_jev_gold.jsonl"
+RESULTS_PATH = Path(__file__).resolve().parent / "eval_jev_results.json"
+LABELS = ("是", "否", "不重要", "是也不是")
+THRESHOLDS = (0.0, 0.3, 0.5, 0.7, 0.9)
+# A dict the chat shim writes the last HTTP status into. judge_question turns
+# every provider error into the same reply, so this is how run_llm tells a
+# relay rate limit (worth retrying) from a real failure (worth recording).
+CHAT_STATUS: ContextVar[dict] = ContextVar("chat_status")
 
 
-def load_relay() -> tuple[str, str]:
-    """Return (base_url, api_key) for the relay.
+def load_plugin_class():
+    """Import main.py with AstrBot stubbed out, mirroring tests/test_judging.py.
 
-    Prefers GUJI_BASE_URL/GUJI_API_KEY env vars; otherwise looks for an
-    api.guji.uno entry in AstrBot's cmd_config.json.
+    Returns:
+        The real ``SoupaiPlugin`` class.
     """
-    env_url = os.environ.get("GUJI_BASE_URL")
-    env_key = os.environ.get("GUJI_API_KEY")
-    if env_url and env_key:
-        return env_url.rstrip("/"), env_key
-    if CONFIG_PATH.exists():
-        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-        for p in cfg.get("provider", []):
-            base = str(p.get("api_base", ""))
-            if "guji.uno" in base:
-                keys = p.get("key") or []
-                if keys:
-                    return base.rstrip("/"), keys[0]
-    raise SystemExit(
-        "no relay credentials: set GUJI_BASE_URL/GUJI_API_KEY or configure "
-        "an api.guji.uno provider in cmd_config.json"
-    )
 
+    def decorate(*args, **kwargs):
+        return lambda method: method
 
-def llm_prompt(question: str, true_answer: str) -> str:
-    """Same prompt as main.py judge_question."""
-    return (
-        f"海龟汤游戏规则：\n"
-        f"1. 故事的完整真相是：{true_answer}\n"
-        f'2. 玩家提问或陈述："{question}"\n'
-        f"3. 你的任务是判断玩家的说法是否符合真相。\n"
-        f'4. 只能回答："是"、"否"、"不重要"或"是也不是"。\n\n'
-        f"判定标准：\n"
-        f'- "是"：\n'
-        f'  玩家命中关键事实或行为，且该信息能直接帮助接近真相。缺少部分细节可以忽略，只要不影响推理方向，就判"是"。\n'
-        f'- "否"：\n'
-        f"  与真相完全不符，或包含明显错误，会使玩家推理走向错误方向。\n"
-        f'- "不重要"：\n'
-        f"  与故事真相无关，或该信息无法推动推理进展。\n"
-        f'- "是也不是"：\n'
-        f"  玩家命中部分事实，但：\n"
-        f"    1) 因果关系不完整或存在偏差；\n"
-        f"    2) 表述中包含可能让玩家推理错误的成分；\n"
-        f"    3) 忽略了与当前描述直接相关的重要关键点。\n"
-        f'  如果只是缺少背景信息，但不影响方向，优先判"是"而不是"是也不是"。\n\n'
-        f"额外说明：\n"
-        f"- 不要求玩家一次性说出全部真相。\n"
-        f'- 允许玩家只描述真相的一部分，只要方向正确且不会误导，就判"是"。\n'
-        f'- 对可能误导玩家的陈述要谨慎，宁可判"是也不是"。\n'
-        f"- 判定时平衡游戏流畅性和推理挑战性。"
-    )
-
-
-SYSTEM_PROMPT = '你是一个海龟汤推理游戏的助手。你必须严格按照游戏规则回答，只能回答"是"、"否"、"不重要"或"是也不是"，不能添加任何其他内容。'
-
-GEN_PROMPT = """你在为海龟汤评测集出题。给定一个海龟汤的汤面与汤底，生成玩家提问样本，并给出每个提问的标准判定（金标准）。
-
-判定定义：
-- "是"：命中关键事实或行为，能直接帮助接近真相；缺少量细节不影响方向也算。
-- "否"：与真相完全不符或明显错误，会把推理带偏。
-- "不重要"：与真相无关，或无法推动推理进展。
-- "是也不是"：命中部分事实但因果不完整，或含有可能误导的成分。
-
-对每道题生成以下六类提问，每类 {per_kind} 条，尽量口语化、像真实玩家会问的：
-1. fact_yes —— 应判"是"的事实性提问
-2. fact_no —— 应判"否"的提问（与真相明显矛盾）
-3. irrelevant —— 应判"不重要"的提问（天气、穿着等与真相无关的细节）
-4. partial —— 应判"是也不是"的提问（说对一半但因果不完整或有误导成分）
-5. vague —— 边界模糊、可此可彼的提问，给出你认为最合理的判定
-6. wrong_dir —— 看似合理但方向错误、应判"否"的诱导性提问
-
-严格输出 JSON 数组，每个元素形如：
-{{"kind": "fact_yes", "question": "...", "gold": "是"}}
-不要输出任何其他内容。
-
-汤面：{puzzle}
-汤底：{answer}"""
-
-
-async def chat(
-    client: httpx.AsyncClient,
-    model: str,
-    prompt: str,
-    system: str | None = None,
-    temperature: float = 0.0,
-    max_tokens: int = 4096,
-) -> str:
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    resp = await client.post(
-        "/v1/chat/completions",
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+    logger = logging.getLogger("soupai.eval")
+    logger.setLevel(logging.ERROR)
+    bindings = {
+        "astrbot": {},
+        "astrbot.api": {"AstrBotConfig": dict, "logger": logger},
+        "astrbot.api.event": {
+            "AstrMessageEvent": object,
+            "MessageChain": object,
+            "MessageEventResult": object,
+            "filter": SimpleNamespace(
+                command=decorate,
+                permission_type=decorate,
+                event_message_type=decorate,
+                on_astrbot_loaded=decorate,
+                PermissionType=SimpleNamespace(ADMIN="admin"),
+                EventMessageType=SimpleNamespace(ALL="all"),
+            ),
         },
-        timeout=120.0,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
-
-
-def parse_generated(text: str) -> list[dict]:
-    m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
-    out = []
-    for item in data:
-        if (
-            isinstance(item, dict)
-            and item.get("kind") in QUESTION_KINDS
-            and isinstance(item.get("question"), str)
-            and item.get("gold") in VALID
-        ):
-            out.append(
-                {
-                    "kind": item["kind"],
-                    "question": item["question"].strip(),
-                    "gold": item["gold"],
-                }
-            )
-    return out
-
-
-async def gen_questions(client, model, puzzle, answer, sem):
-    async with sem:
-        try:
-            text = await chat(
-                client,
-                model,
-                GEN_PROMPT.format(per_kind=PER_KIND, puzzle=puzzle, answer=answer),
-                temperature=0.7,
-            )
-            return parse_generated(text)
-        except Exception as e:
-            print(f"  [gen] failed: {e}")
-            return []
-
-
-async def jev_judge(client, model, puzzle, answer, question, sem):
-    payload = {
-        "model": model,
-        "state": {"谜面": puzzle, "真相": answer, "玩家提问": question},
-        "questions": {
-            "verdict": {
-                "type": "choice",
-                "instructions": JEV_INSTRUCTIONS,
-                "criteria": JUDGE_CRITERIA,
-            }
+        "astrbot.api.message_components": {"At": object, "Reply": object},
+        "astrbot.api.provider": {"LLMResponse": object},
+        "astrbot.api.star": {"Context": object, "Star": object, "StarTools": object},
+        "astrbot.core": {},
+        "astrbot.core.utils": {},
+        "astrbot.core.utils.session_waiter": {
+            "SessionController": object,
+            "SessionFilter": object,
+            "session_waiter": decorate,
         },
+        "soupai_eval_runtime": {"__path__": [str(PLUGIN_DIR)]},
+        "soupai_eval_runtime.webui": {"SoupaiWebApi": object},
     }
-    async with sem:
-        t0 = time.monotonic()
-        try:
-            resp = await client.post("/v1/systemone", json=payload, timeout=30.0)
-            resp.raise_for_status()
-            ans = resp.json()["answers"]["verdict"]
-            probs = ans.get("probabilities") or {}
-            return {
-                "choice": ans.get("choice"),
-                "confidence": ans.get("confidence"),
-                "probabilities": probs,
-                "latency": round(time.monotonic() - t0, 3),
-                "error": None,
-            }
-        except Exception as e:
-            return {
-                "choice": None,
-                "confidence": None,
-                "probabilities": {},
-                "latency": round(time.monotonic() - t0, 3),
-                "error": str(e),
-            }
+    modules = {}
+    for name, attributes in bindings.items():
+        modules[name] = ModuleType(name)
+        modules[name].__dict__.update(attributes)
+    spec = importlib.util.spec_from_file_location(
+        "soupai_eval_runtime.main", PLUGIN_DIR / "main.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    modules[spec.name] = module
+    with patch.dict(sys.modules, modules):
+        spec.loader.exec_module(module)
+    return module.SoupaiPlugin
 
 
-async def llm_judge(client, model, answer, question, sem):
-    async with sem:
-        t0 = time.monotonic()
-        try:
-            text = await chat(
-                client,
-                model,
-                llm_prompt(question, answer),
-                system=SYSTEM_PROMPT,
-                max_tokens=2048,
-            )
-            reply = text.strip()
-            for v in VALID:  # tolerate e.g. "是。" — same fallback spirit as plugin
-                if reply.startswith(v):
-                    reply = v
-                    break
-            return {
-                "choice": reply if reply in VALID else None,
-                "raw": text.strip()[:80],
-                "latency": round(time.monotonic() - t0, 3),
-                "error": None if reply in VALID else "invalid_reply",
-            }
-        except Exception as e:
-            return {
-                "choice": None,
-                "raw": "",
-                "latency": round(time.monotonic() - t0, 3),
-                "error": str(e),
-            }
+def make_plugin(plugin_cls, config: dict, provider=None):
+    """Build a plugin instance without AstrBot, the way the unit tests do.
+
+    Args:
+        plugin_cls: The ``SoupaiPlugin`` class.
+        config: Plugin configuration read by ``_load_config``.
+        provider: Chat provider returned for every provider lookup.
+
+    Returns:
+        A plugin instance ready for ``judge_question`` and ``_jev_choice``.
+    """
+    plugin = plugin_cls.__new__(plugin_cls)
+    plugin._jev_client = None
+    plugin.config = config
+    plugin._load_config()
+    plugin.context = SimpleNamespace(
+        get_provider_by_id=Mock(return_value=provider),
+        get_using_provider=Mock(return_value=provider),
+    )
+    return plugin
 
 
-def accuracy(rows, key):
-    valid = [r for r in rows if r[key]["choice"] in VALID]
-    if not valid:
-        return 0, 0.0
-    correct = sum(1 for r in valid if r[key]["choice"] == r["gold"])
-    return len(valid), correct / len(valid)
+class ChatProvider:
+    """The one method of an AstrBot provider that ``judge_question`` uses."""
+
+    def __init__(self, client: httpx.AsyncClient, model: str):
+        self.client = client
+        self.model = model
+
+    async def text_chat(self, prompt, contexts, func_tool, image_urls, system_prompt):
+        resp = await self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+        )
+        status = CHAT_STATUS.get(None)
+        if status is not None:
+            status["code"] = resp.status_code
+        resp.raise_for_status()
+        message = resp.json()["choices"][0]["message"]
+        return SimpleNamespace(completion_text=message.get("content") or "")
 
 
-def bins(rows, key):
-    """Accuracy per confidence bin; also what threshold adoption would do."""
-    edges = [0.0, 0.3, 0.5, 0.7, 0.8, 0.9, 1.01]
-    out = []
-    for lo, hi in zip(edges, edges[1:]):
-        sel = [
-            r
-            for r in rows
-            if r[key]["confidence"] is not None and lo <= r[key]["confidence"] < hi
-        ]
-        if not sel:
+def load_items(history_mode: str) -> list[dict]:
+    """Read the gold set and attach puzzle, answer, history and Jev state.
+
+    Args:
+        history_mode: ``seq`` gives each question the previous three questions
+            of its story as history; ``none`` sends no history. A line with an
+            explicit ``history`` always uses it.
+
+    Returns:
+        One dict per gold question.
+
+    Raises:
+        ValueError: A gold line is malformed or names an unknown story.
+    """
+    bank = json.loads((PLUGIN_DIR / "network_soupai.json").read_text(encoding="utf-8"))
+    stories = {story["id"]: story for story in bank}
+    items, asked = [], {}
+    for number, line in enumerate(
+        GOLD_PATH.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.strip():
             continue
-        correct = sum(1 for r in sel if r[key]["choice"] == r["gold"])
-        out.append(
+        row = json.loads(line)
+        story = stories.get(row.get("story_id"))
+        if story is None or row.get("gold") not in LABELS or not row.get("question"):
+            raise ValueError(f"gold line {number} is malformed: {line}")
+        previous = asked.setdefault(row["story_id"], [])
+        if row.get("history") is not None:
+            history = row["history"]
+        else:
+            history = previous[-3:] if history_mode == "seq" else []
+        # Same shape judge_question builds; route() asserts the two still match.
+        state = {"谜面": story["puzzle"], "真相": story["answer"]}
+        state["玩家提问"] = row["question"].strip()
+        if history:
+            state["相关问答"] = history[-3:]
+        items.append(
             {
-                "range": f"[{lo:.1f},{hi if hi <= 1 else 1.0:.1f})",
-                "n": len(sel),
-                "acc": round(correct / len(sel), 3),
+                "line": number,
+                "tag": row.get("tag", ""),
+                "story_id": row["story_id"],
+                "question": row["question"],
+                "gold": row["gold"],
+                "puzzle": story["puzzle"],
+                "answer": story["answer"],
+                "history": history,
+                "state": state,
             }
         )
-    return out
+        previous.append({"question": row["question"], "answer": row["gold"]})
+    return items
 
 
-async def main():
-    sample_size = int(sys.argv[1]) if len(sys.argv) > 1 else 15
-    conc = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+async def route(plugin_cls, items: list[dict]) -> None:
+    """Record, offline, which engine production would pick for each question.
 
-    base_url, key = load_relay()
-    print(f"relay: {base_url}")
-
-    stories = json.loads(
-        (PLUGIN_DIR / "network_soupai.json").read_text(encoding="utf-8")
+    Sets ``item["route"]`` to ``jev``, ``compound_question`` or
+    ``context_required`` (sent straight to the judge LLM), or ``clarify``
+    (answered with a clarification request and no model call).
+    """
+    llm = SimpleNamespace(
+        text_chat=AsyncMock(return_value=SimpleNamespace(completion_text="否"))
     )
-    random.seed(42)
-    sample = random.sample(stories, min(sample_size, len(stories)))
+    plugin = make_plugin(
+        plugin_cls,
+        {"judge_engine": "jev", "jev_api_key": "offline", "judge_llm_provider": "x"},
+        llm,
+    )
+    plugin._jev_choice = AsyncMock(
+        return_value={
+            "choice": "是",
+            "confidence": 1.0,
+            "probabilities": {},
+            "threshold": 0.5,
+            "reason": None,
+            "extra": {},
+        }
+    )
+    for item in items:
+        plugin._jev_choice.reset_mock()
+        llm.text_chat.reset_mock()
+        _, judged_by = await plugin.judge_question(
+            item["question"],
+            item["answer"],
+            puzzle=item["puzzle"],
+            qa_history=item["history"],
+        )
+        if plugin._jev_choice.await_args is not None:
+            if plugin._jev_choice.await_args.kwargs["state"] != item["state"]:
+                raise RuntimeError("main.py now builds the Jev state differently")
+        if judged_by.get("engine") == "jev":
+            item["route"] = "jev"
+        elif llm.text_chat.await_args is not None:
+            item["route"] = judged_by.get("routing_reason") or "llm"
+        else:
+            item["route"] = "clarify"
 
-    client = httpx.AsyncClient(
+
+async def run_jev(plugin_cls, models, items, base_url, key, repeat) -> None:
+    """Judge every question with each decision model, one request at a time.
+
+    Models alternate which goes first on each question so network drift is
+    shared evenly. Requests are sequential so latency is not queueing time.
+    Transient request failures are retried twice; ``attempts`` records it.
+    """
+    captured: dict = {}
+
+    async def capture(response: httpx.Response) -> None:
+        await response.aread()
+        captured["status"] = response.status_code
+        captured["upstream_ms"] = response.headers.get("x-envoy-upstream-service-time")
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if isinstance(body, dict):
+            captured["model"] = body.get("model")
+            captured["server_ms"] = body.get("latency_ms")
+            captured["usage"] = body.get("usage")
+
+    plugins = {}
+    for model in models:
+        plugin = make_plugin(
+            plugin_cls,
+            {
+                "judge_engine": "jev",
+                "judge_fallback_to_llm": True,
+                "jev_api_key": key,
+                "jev_base_url": base_url,
+                "jev_model": model,
+                "jev_judge_min_confidence": 0.5,
+            },
+        )
+        plugin._jev_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+            follow_redirects=False,
+            event_hooks={"response": [capture]},
+        )
+        plugins[model] = plugin
+        # Warm the connection so the first question is not charged the handshake.
+        await plugin._jev_choice(items[0]["state"], "warm up", {"a": "a", "b": "b"})
+
+    total = len(items) * len(models) * repeat
+    done, started = 0, time.monotonic()
+    for run in range(repeat):
+        for index, item in enumerate(items):
+            order = models if (index + run) % 2 == 0 else models[::-1]
+            for model in order:
+                for attempt in range(1, 4):
+                    captured.clear()
+                    begin = time.perf_counter()
+                    result = await plugins[model]._jev_choice(
+                        item["state"],
+                        plugin_cls._JUDGE_INSTRUCTIONS,
+                        plugin_cls._JUDGE_CRITERIA,
+                    )
+                    elapsed = time.perf_counter() - begin
+                    if result["reason"] != "request_failed" or attempt == 3:
+                        break
+                    await asyncio.sleep(2 * attempt)
+                result.pop("extra", None)
+                runs = item.setdefault("jev", {}).setdefault(model, [])
+                runs.append(
+                    {
+                        **result,
+                        "latency": round(elapsed, 3),
+                        "attempts": attempt,
+                        **captured,
+                    }
+                )
+                done += 1
+                if done % 50 == 0:
+                    rate = done / (time.monotonic() - started)
+                    print(f"  jev {done}/{total} ({rate:.1f} req/s)", flush=True)
+    for plugin in plugins.values():
+        await plugin._jev_client.aclose()
+
+
+async def run_llm(plugin_cls, models, items, base_url, key, concurrency) -> None:
+    """Judge every question with each chat model through judge_question.
+
+    A relay rate limit (HTTP 429) is not a verdict, so that question is asked
+    again after a backoff, up to five times; ``attempts`` records it. Any
+    other failure is kept as the model's result.
+    """
+    async with httpx.AsyncClient(
         base_url=base_url,
         headers={"Authorization": f"Bearer {key}"},
-        timeout=httpx.Timeout(120.0),
-    )
-
-    # sanity: available models
-    try:
-        models = (await client.get("/v1/models", timeout=30.0)).json()
-        ids = [m["id"] for m in models.get("data", [])]
-        print(
-            f"models on relay ({len(ids)}): "
-            f"{[i for i in ids if 'jev' in i or 'step-3' in i][:10]}"
-        )
-    except Exception as e:
-        print(f"model list failed (continuing anyway): {e}")
-
-    sem = asyncio.Semaphore(conc)
-
-    # 1) generate questions per puzzle
-    print(f"\n== generating questions for {len(sample)} puzzles ==")
-    gen_tasks = [
-        gen_questions(client, "step-3.7-flash", s["puzzle"], s["answer"], sem)
-        for s in sample
-    ]
-    gen_results = await asyncio.gather(*gen_tasks)
-
-    rows = []
-    for story, qs in zip(sample, gen_results):
-        for q in qs:
-            rows.append(
-                {
-                    "story_id": story.get("id"),
-                    "puzzle": story["puzzle"],
-                    "answer": story["answer"],
-                    **q,
-                }
+        timeout=httpx.Timeout(90.0),
+    ) as client:
+        for model in models:
+            plugin = make_plugin(
+                plugin_cls,
+                {"judge_engine": "llm", "judge_llm_provider": "judge"},
+                ChatProvider(client, model),
             )
-    # dedup identical questions within a story
-    seen, deduped = set(), []
-    for r in rows:
-        k = (r["story_id"], r["question"])
-        if k not in seen:
-            seen.add(k)
-            deduped.append(r)
-    rows = deduped
-    print(
-        f"generated {len(rows)} questions "
-        f"(gold dist: {{v: sum(1 for r in rows if r['gold'] == v) for v in VALID}})"
-    )
-    by_kind = {}
-    for r in rows:
-        by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
-    print(f"by kind: {by_kind}")
+            semaphore = asyncio.Semaphore(concurrency)
+            progress = {"done": 0}
 
-    # 2) judge with Jev and LLM
-    print(f"\n== judging {len(rows)} questions with jev-latest + step-3.7-flash ==")
-    jev_tasks = [
-        jev_judge(client, "jev-latest", r["puzzle"], r["answer"], r["question"], sem)
-        for r in rows
-    ]
-    llm_tasks = [
-        llm_judge(client, "step-3.7-flash", r["answer"], r["question"], sem)
-        for r in rows
-    ]
-    jev_results, llm_results = await asyncio.gather(
-        asyncio.gather(*jev_tasks), asyncio.gather(*llm_tasks)
-    )
-    for r, j, llm in zip(rows, jev_results, llm_results):
-        r["jev"], r["llm"] = j, llm
+            async def judge(item: dict) -> None:
+                async with semaphore:
+                    for attempt in range(1, 6):
+                        status = {}
+                        CHAT_STATUS.set(status)
+                        begin = time.perf_counter()
+                        reply, judged_by = await plugin.judge_question(
+                            item["question"],
+                            item["answer"],
+                            puzzle=item["puzzle"],
+                            qa_history=item["history"],
+                        )
+                        elapsed = time.perf_counter() - begin
+                        if status.get("code") != 429 or attempt == 5:
+                            break
+                        await asyncio.sleep(5 * attempt)
+                    item.setdefault("llm", {})[model] = {
+                        "choice": reply if judged_by.get("engine") == "llm" else None,
+                        "reply": reply,
+                        "latency": round(elapsed, 3),
+                        "attempts": attempt,
+                        "status": status.get("code"),
+                    }
+                    progress["done"] += 1
+                    if progress["done"] % 50 == 0:
+                        print(f"  {model} {progress['done']}/{len(items)}", flush=True)
 
-    RESULTS_PATH.write_text(
-        json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"raw results -> {RESULTS_PATH}")
+            await asyncio.gather(*(judge(item) for item in items))
 
-    # 3) report
-    print("\n== accuracy ==")
-    for key in ("jev", "llm"):
-        n, acc = accuracy(rows, key)
-        errs = sum(1 for r in rows if r[key]["error"])
-        lat = sorted(r[key]["latency"] for r in rows)
-        med = lat[len(lat) // 2] if lat else 0
-        print(f"{key}: n={n} acc={acc:.3f} errors={errs} median_latency={med}s")
 
-    print("\n== per-kind accuracy ==")
-    for kind in QUESTION_KINDS:
-        sub = [r for r in rows if r["kind"] == kind]
-        jn, jacc = accuracy(sub, "jev")
-        ln, lacc = accuracy(sub, "llm")
-        print(f"{kind:10s} n={len(sub):3d}  jev={jacc:.3f}  llm={lacc:.3f}")
+def quantile(values: list[float], q: float) -> float:
+    """Nearest-rank quantile of an unsorted list; NaN when empty."""
+    if not values:
+        return math.nan
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))]
 
-    print("\n== jev confidence bins ==")
-    for b in bins(rows, "jev"):
-        print(f"  {b['range']}: n={b['n']} acc={b['acc']}")
 
-    print("\n== probability distribution sanity ==")
-    sums = [
-        sum(
-            p for p in r["jev"]["probabilities"].values() if isinstance(p, (int, float))
+def score(rows: list[dict], pick) -> dict:
+    """Accuracy, coverage and per-label precision/recall for one engine.
+
+    Args:
+        rows: Gold items.
+        pick: Returns the engine's verdict for an item, or None.
+
+    Returns:
+        ``n``, ``answered``, ``correct``, ``acc`` (no verdict counts as wrong),
+        ``macro_f1`` and per-label ``p``/``r``/``f1``.
+    """
+    answered = [row for row in rows if pick(row) in LABELS]
+    correct = sum(pick(row) == row["gold"] for row in answered)
+    per_label, f1s = {}, []
+    for label in LABELS:
+        gold_n = sum(row["gold"] == label for row in rows)
+        pred_n = sum(pick(row) == label for row in rows)
+        hit = sum(pick(row) == label == row["gold"] for row in rows)
+        precision = hit / pred_n if pred_n else 0.0
+        recall = hit / gold_n if gold_n else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if hit else 0.0
+        per_label[label] = {"n": gold_n, "p": precision, "r": recall, "f1": f1}
+        if gold_n:
+            f1s.append(f1)
+    return {
+        "n": len(rows),
+        "answered": len(answered),
+        "correct": correct,
+        "acc": correct / len(rows) if rows else math.nan,
+        "macro_f1": sum(f1s) / len(f1s) if f1s else math.nan,
+        "labels": per_label,
+    }
+
+
+def mcnemar(rows: list[dict], pick_a, pick_b) -> tuple[int, int, int, int, float]:
+    """Paired comparison of two engines on the same questions.
+
+    Returns:
+        Both right, only A right, only B right, both wrong, and the exact
+        two-sided McNemar p-value over the discordant pairs.
+    """
+    both = only_a = only_b = neither = 0
+    for row in rows:
+        a, b = pick_a(row) == row["gold"], pick_b(row) == row["gold"]
+        both += a and b
+        only_a += a and not b
+        only_b += b and not a
+        neither += not a and not b
+    k, n = min(only_a, only_b), only_a + only_b
+    p = min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2**n) if n else 1.0
+    return both, only_a, only_b, neither, p
+
+
+def report(items: list[dict], jev_models: list[str], llm_models: list[str]) -> None:
+    """Print the comparison tables."""
+
+    def jev_first(model):
+        return lambda row: row["jev"][model][0]
+
+    def jev_pick(model):
+        return lambda row: row["jev"][model][0]["choice"]
+
+    def llm_pick(model):
+        return lambda row: row["llm"][model]["choice"]
+
+    def adopted(result, threshold):
+        return (
+            result["choice"] in LABELS
+            and result["confidence"] is not None
+            and result["confidence"] >= threshold
+            and result["reason"] in (None, "low_confidence")
         )
-        for r in rows
-        if r["jev"]["probabilities"]
-    ]
-    if sums:
-        sums.sort()
+
+    routed = [row for row in items if row["route"] == "jev"]
+    gold = {label: sum(row["gold"] == label for row in items) for label in LABELS}
+    routes = {}
+    for row in items:
+        routes[row["route"]] = routes.get(row["route"], 0) + 1
+    print(f"\n题目 {len(items)} 道，来自 {len({r['story_id'] for r in items})} 个汤")
+    print(f"金标准分布 {gold}")
+    print(f"线上分流 {routes}（jev = 生产环境里会交给决策模型的题）")
+
+    engines = [(m, jev_pick(m)) for m in jev_models]
+    engines += [(m, llm_pick(m)) for m in llm_models]
+    for title, rows in (("全部题目", items), ("线上会交给决策模型的题", routed)):
+        print(f"\n== 准确率：{title}（n={len(rows)}）==")
         print(
-            f"  prob sum: min={sums[0]:.3f} median={sums[len(sums) // 2]:.3f} max={sums[-1]:.3f}"
+            f"{'引擎':26s} {'准确率':>7s} {'macroF1':>8s} {'有判定':>6s}  "
+            + "  ".join(f"{label}召回" for label in LABELS)
         )
-    agrees = [
-        r
-        for r in rows
-        if r["jev"]["probabilities"]
-        and max(r["jev"]["probabilities"], key=r["jev"]["probabilities"].get)
-        == r["jev"]["choice"]
-    ]
-    n_probs = sum(1 for r in rows if r["jev"]["probabilities"])
-    print(f"  argmax(probabilities)==choice: {len(agrees)}/{n_probs}")
-    spreads = [
-        max(r["jev"]["probabilities"].values())
-        - sorted(r["jev"]["probabilities"].values())[-2]
-        for r in rows
-        if len(r["jev"]["probabilities"]) >= 2
-    ]
-    if spreads:
-        spreads.sort()
-        print(f"  top1-top2 spread: median={spreads[len(spreads) // 2]:.3f}")
+        for name, pick in engines:
+            s = score(rows, pick)
+            recalls = "  ".join(
+                f"{s['labels'][label]['r']:>{len(label) + 2}.2f}" for label in LABELS
+            )
+            print(
+                f"{name:26s} {s['acc']:7.3f} {s['macro_f1']:8.3f} "
+                f"{s['answered']:>4d}/{s['n']:<3d} {recalls}"
+            )
 
+    for model in jev_models:
+        first = jev_first(model)
+        fails = [row for row in items if first(row)["reason"] == "request_failed"]
+        retried = sum(first(row)["attempts"] > 1 for row in items)
+        versions = sorted({str(first(row).get("model")) for row in items})
+        print(f"\n== {model}（响应 model 字段：{', '.join(versions)}）==")
+        print(f"请求失败 {len(fails)}，重试后成功 {retried - len(fails)}")
+        reasons = {}
+        for row in routed:
+            reason = first(row)["reason"] or "adopted"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        print(f"线上门槛 0.5 下的去向（仅决策模型题）：{reasons}")
+        print("  门槛  采纳率  采纳部分准确率")
+        for threshold in THRESHOLDS:
+            taken = [row for row in routed if adopted(first(row), threshold)]
+            right = sum(first(row)["choice"] == row["gold"] for row in taken)
+            share = len(taken) / len(routed) if routed else math.nan
+            acc = right / len(taken) if taken else math.nan
+            print(f"  {threshold:.1f}   {share:6.1%}  {acc:.3f}")
+        print("  置信度分桶（全部题目）：")
+        edges = (0.0, 0.3, 0.5, 0.7, 0.9, 1.01)
+        for low, high in zip(edges, edges[1:]):
+            chosen = [
+                row
+                for row in items
+                if first(row)["confidence"] is not None
+                and low <= first(row)["confidence"] < high
+            ]
+            if chosen:
+                right = sum(first(row)["choice"] == row["gold"] for row in chosen)
+                print(
+                    f"    [{low:.1f},{min(high, 1.0):.1f}) n={len(chosen):3d} "
+                    f"acc={right / len(chosen):.3f}"
+                )
+        ok = [first(row) for row in items if first(row)["reason"] != "request_failed"]
+        total = [r["latency"] * 1000 for r in ok]
+        upstream = [float(r["upstream_ms"]) for r in ok if r.get("upstream_ms")]
+        mean = sum(total) / len(total) if total else math.nan
+        peak = max(total) if total else math.nan
+        print(
+            f"  端到端延迟 ms：均值 {mean:.0f}  p50 {quantile(total, 0.5):.0f}  "
+            f"p90 {quantile(total, 0.9):.0f}  p99 {quantile(total, 0.99):.0f}  "
+            f"最大 {peak:.0f}"
+        )
+        if upstream:
+            print(
+                "  上游处理 ms（x-envoy-upstream-service-time）："
+                f"p50 {quantile(upstream, 0.5):.0f}  p90 {quantile(upstream, 0.9):.0f}  "
+                f"p99 {quantile(upstream, 0.99):.0f}"
+            )
+        runs = [row["jev"][model] for row in items if len(row["jev"][model]) > 1]
+        if runs:
+            flips = sum(len({r["choice"] for r in rs}) > 1 for rs in runs)
+            print(f"  重复请求：{flips}/{len(runs)} 道题的判定前后不一致")
+
+    for i, model_a in enumerate(jev_models):
+        for model_b in jev_models[i + 1 :]:
+            for title, rows in (("全部题目", items), ("决策模型题", routed)):
+                both, only_a, only_b, neither, p = mcnemar(
+                    rows, jev_pick(model_a), jev_pick(model_b)
+                )
+                print(
+                    f"\n== 配对比较（{title}）{model_a} vs {model_b} ==\n"
+                    f"都对 {both}  仅前者对 {only_a}  仅后者对 {only_b}  都错 {neither}  "
+                    f"McNemar p={p:.4f}"
+                )
+
+    tags = sorted({row["tag"] for row in items})
+    print("\n== 按题型准确率（全部题目）==")
     print(
-        "\n== threshold tradeoff (adopt jev if confidence>=t else fall back to llm) =="
+        f"{'题型':12s} {'n':>4s}  "
+        + "  ".join(f"{name[:16]:>16s}" for name, _ in engines)
     )
-    print("  t      adopt%  jev_adopted_acc  blended_acc(jev+llm fallback)")
-    llm_map = {id(r): r["llm"]["choice"] for r in rows}
-    for t in (0.0, 0.3, 0.5, 0.7, 0.9):
-        adopted, adopted_correct, blended, blended_n = 0, 0, 0, 0
-        for r in rows:
-            conf = r["jev"]["confidence"]
-            use_jev = conf is not None and conf >= t and r["jev"]["choice"] in VALID
-            final = r["jev"]["choice"] if use_jev else llm_map[id(r)]
-            if final not in VALID:
+    for tag in tags:
+        rows = [row for row in items if row["tag"] == tag]
+        cells = "  ".join(f"{score(rows, pick)['acc']:16.3f}" for _, pick in engines)
+        print(f"{tag:12s} {len(rows):4d}  {cells}")
+
+    for model in llm_models:
+        latency = [row["llm"][model]["latency"] * 1000 for row in items]
+        missing = [row for row in items if row["llm"][model]["choice"] is None]
+        print(
+            f"\n== {model} ==\n无判定 {len(missing)}（需要澄清/失败/格式无效），"
+            f"延迟 ms p50 {quantile(latency, 0.5):.0f} p90 {quantile(latency, 0.9):.0f}"
+        )
+
+    if jev_models and llm_models:
+        print("\n== 线上组合准确率（决策模型题且置信度≥0.5 用决策模型，其余用 LLM）==")
+        for model in jev_models:
+            for llm in llm_models:
+
+                def blended(row, model=model, llm=llm):
+                    result = row["jev"][model][0]
+                    if row["route"] == "jev" and result["reason"] is None:
+                        return result["choice"]
+                    return row["llm"][llm]["choice"]
+
+                s = score(items, blended)
+                print(
+                    f"  {model} + {llm}: {s['acc']:.3f}（有判定 {s['answered']}/{s['n']}）"
+                )
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--jev", nargs="*", default=["jev-latest", "decision-model-preview"]
+    )
+    parser.add_argument(
+        "--llm", nargs="*", default=["deepseek-v4.1-flash", "step-5-preview"]
+    )
+    parser.add_argument("--history", choices=("seq", "none"), default="seq")
+    parser.add_argument(
+        "--concurrency", type=int, default=3, help="parallel calls per chat model"
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="Jev passes, for consistency"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, help="only the first N questions"
+    )
+    parser.add_argument(
+        "--reuse", type=Path, nargs="+", default=[], help="earlier results files"
+    )
+    parser.add_argument("--out", type=Path, default=RESULTS_PATH)
+    args = parser.parse_args()
+
+    plugin_cls = load_plugin_class()
+    items = load_items(args.history)
+    if args.limit:
+        items = items[: args.limit]
+    await route(plugin_cls, items)
+
+    for path in args.reuse:
+        cached = {
+            (row["story_id"], row["question"]): row
+            for row in json.loads(path.read_text(encoding="utf-8"))
+        }
+        for item in items:
+            old = cached.get((item["story_id"], item["question"]))
+            # An output only answers the exact state it was asked about; a gold
+            # edit changes the history of the questions that follow it.
+            if old is None or old.get("state") != item["state"]:
                 continue
-            blended_n += 1
-            blended += final == r["gold"]
-            if use_jev:
-                adopted += 1
-                adopted_correct += r["jev"]["choice"] == r["gold"]
-        if blended_n:
-            print(
-                f"  {t:.1f}    {adopted / blended_n:6.1%}  "
-                f"{(adopted_correct / adopted) if adopted else float('nan'):.3f}          "
-                f"{blended / blended_n:.3f}"
+            for kind, models in (("jev", args.jev), ("llm", args.llm)):
+                for model in models:
+                    output = old.get(kind, {}).get(model)
+                    # A rate limit or dropped request is not an answer; ask again.
+                    if not output or (
+                        output[0]["reason"] == "request_failed"
+                        if kind == "jev"
+                        else output.get("status") == 429
+                    ):
+                        continue
+                    item.setdefault(kind, {})[model] = output
+    jev_todo = {m: [i for i in items if m not in i.get("jev", {})] for m in args.jev}
+    llm_todo = {m: [i for i in items if m not in i.get("llm", {})] for m in args.llm}
+    pending = sum(map(len, jev_todo.values())) + sum(map(len, llm_todo.values()))
+    print(
+        f"{len(items)} questions, history={args.history}, {pending} model calls to make"
+    )
+
+    key = os.environ.get("GUJI_API_KEY", "").strip()
+    base_url = os.environ.get("GUJI_BASE_URL", "https://api.guji.uno").rstrip("/")
+    if pending and not key:
+        raise SystemExit("set GUJI_API_KEY (and optionally GUJI_BASE_URL)")
+
+    # Models that lack the same full set share one alternating pass, which keeps
+    # their latency comparable; partial gaps are filled model by model.
+    together = [m for m in args.jev if len(jev_todo[m]) == len(items)]
+    if together:
+        print(f"== decision models {together} ==", flush=True)
+        await run_jev(plugin_cls, together, items, base_url, key, args.repeat)
+    for model in args.jev:
+        if model not in together and jev_todo[model]:
+            print(f"== {model}: {len(jev_todo[model])} questions ==", flush=True)
+            await run_jev(
+                plugin_cls, [model], jev_todo[model], base_url, key, args.repeat
+            )
+    for model in args.llm:
+        if llm_todo[model]:
+            print(f"== {model}: {len(llm_todo[model])} questions ==", flush=True)
+            await run_llm(
+                plugin_cls, [model], llm_todo[model], base_url, key, args.concurrency
             )
 
-    print("\n== disagreements (sample) ==")
-    shown = 0
-    for r in rows:
-        j, llm = r["jev"]["choice"], r["llm"]["choice"]
-        if j in VALID and llm in VALID and j != llm and shown < 8:
-            flag_j = "✓" if j == r["gold"] else "✗"
-            flag_l = "✓" if llm == r["gold"] else "✗"
-            print(
-                f"  [{r['kind']}] gold={r['gold']} jev={j}{flag_j} llm={llm}{flag_l}  {r['question'][:40]}"
-            )
-            shown += 1
-
-    await client.aclose()
+    args.out.write_text(
+        json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    print(f"raw results -> {args.out}")
+    report(items, args.jev, args.llm)
 
 
 if __name__ == "__main__":

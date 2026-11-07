@@ -262,7 +262,7 @@ class GameArchive:
     """
 
     _MAX_ENTRIES = 200
-    # 运行时字段，不进存档：task 不可序列化，_player_qa 是判定用的中间态
+    # 运行时字段，不进存档：task 不可序列化，answer 只在内存里
     _RUNTIME_KEYS = ("_session_task", "_player_qa", "is_active", "answer")
 
     def __init__(self, data_path=None):
@@ -814,6 +814,9 @@ class SoupaiPlugin(Star):
 
         # Jev 的 httpx 客户端，首次判定时惰性创建
         self._jev_client: httpx.AsyncClient | None = None
+        # 熔断状态：连续失败到阈值就暂停新调用，免得每次提问都白等一个超时
+        self._jev_failure_streak = 0
+        self._jev_paused_until = 0.0
 
         # 发奖任务脱钩于对局收尾，拿着强引用免得被垃圾回收提前收走
         self._reward_tasks: set[asyncio.Task] = set()
@@ -959,6 +962,10 @@ class SoupaiPlugin(Star):
             self.judge_engine = "llm"
         self.judge_fallback_to_llm = bool(
             self.config.get("judge_fallback_to_llm", True)
+        )
+        # 入库前内容审核。与标注、查重复核共用同一个 LLM 服务商。
+        self.content_moderation_enabled = bool(
+            self.config.get("content_moderation_enabled", True)
         )
 
         self.jev_api_key = str(self.config.get("jev_api_key") or "").strip()
@@ -1182,6 +1189,132 @@ class SoupaiPlugin(Star):
             }
         }
 
+    # 提示词改版就换这个版本号：历史对局要能和当时的判题口径对上。
+    # 判定标准的措辞一变，旧记录就不能再拿新规则解释。
+    JEV_PROMPT_VERSION = "v3-2026-11"
+    # 单次调用的超时与总期限。总期限要容得下两次尝试加退避，否则重试没意义。
+    JEV_ATTEMPT_TIMEOUT = 20.0
+    JEV_TOTAL_DEADLINE = 45.0
+    # 连续失败这么多次就暂停一段时间，别让每次提问都白等一个超时
+    JEV_FAILURE_LIMIT = 5
+    JEV_PAUSE_SECONDS = 30.0
+
+    async def _jev_post(self, payload: dict, result: dict) -> httpx.Response | None:
+        """Send one SystemOne request, retrying transient failures within a deadline.
+
+        错误分类照抄生产实践：网络中断、上游 5xx、限流、超时都可以重试一次，
+        鉴权和协议错误不重试——密钥错了再试一百次也是错。重试与否由总期限
+        兜底，中途剩余时间不够就不再发起第二次。
+
+        Args:
+            payload: The ``model``/``state``/``questions`` body.
+            result: Per-call diagnostics updated in place (``attempts``,
+                ``latency_ms``, ``reason``) so the caller keeps whatever
+                happened even when the request ultimately fails.
+
+        Returns:
+            A successful HTTP response, or None after recording ``reason``.
+        """
+        loop = asyncio.get_running_loop()
+        if loop.time() < getattr(self, "_jev_paused_until", 0.0):
+            logger.warning("Jev is paused after repeated failures; skipping request")
+            result["reason"] = "request_failed"
+            return None
+        deadline = loop.time() + self.JEV_TOTAL_DEADLINE
+        attempt = 0
+        last_error = ""
+        while attempt < 2:
+            attempt += 1
+            remaining = deadline - loop.time()
+            if remaining <= 0.5:
+                break
+            started = loop.time()
+            try:
+                if self._jev_client is None:
+                    self._jev_client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(self.JEV_ATTEMPT_TIMEOUT),
+                        follow_redirects=False,
+                    )
+                base_url = self.jev_base_url.removesuffix("/v1")
+                resp = await asyncio.wait_for(
+                    self._jev_client.post(
+                        f"{base_url}/v1/systemone",
+                        headers={"Authorization": f"Bearer {self.jev_api_key}"},
+                        json=payload,
+                    ),
+                    timeout=min(self.JEV_ATTEMPT_TIMEOUT, remaining),
+                )
+                resp.raise_for_status()
+                result["attempts"] = attempt
+                result["latency_ms"] = round((loop.time() - started) * 1000)
+                return resp
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                last_error = f"HTTP {status}"
+                result["attempts"] = attempt
+                result["latency_ms"] = round((loop.time() - started) * 1000)
+                if status in (401, 403):
+                    # 密钥或权限问题，重试只会更快地把配额打光
+                    logger.error(f"Jev auth failed ({status}); not retrying")
+                    self._jev_note_failure()
+                    result["reason"] = "request_failed"
+                    return None
+                if status == 429 or status >= 500:
+                    wait = 0.0
+                    if status == 429:
+                        header = exc.response.headers.get("retry-after", "")
+                        try:
+                            wait = min(float(header), max(deadline - loop.time(), 0))
+                        except (TypeError, ValueError):
+                            wait = 0.0
+                    if attempt < 2 and deadline - loop.time() > wait:
+                        logger.info(f"Jev {last_error}, retrying in {wait:.1f}s")
+                        await asyncio.sleep(wait)
+                        continue
+                logger.warning(f"Jev request failed: {last_error}")
+                self._jev_note_failure()
+                result["reason"] = "request_failed"
+                return None
+            except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+                last_error = f"timeout ({exc.__class__.__name__})"
+            except Exception as exc:
+                # 连接中断、DNS 失败、读超时都归到这里，属于可重试
+                last_error = f"{exc.__class__.__name__}: {exc}"
+            result["attempts"] = attempt
+            result["latency_ms"] = round((loop.time() - started) * 1000)
+            if attempt < 2 and deadline - loop.time() > 0.5:
+                logger.info(f"Jev {last_error}, retrying")
+                await asyncio.sleep(0.3 * attempt)
+                continue
+            logger.warning(f"Jev request failed: {last_error}")
+            self._jev_note_failure()
+            result["reason"] = "request_failed"
+            return None
+        self._jev_note_failure()
+        result["reason"] = "request_failed"
+        return None
+
+    def _jev_note_failure(self) -> None:
+        """Count an infrastructure failure and pause Jev when it keeps happening.
+
+        只有请求层面的失败才计数。判定被判为「无效响应」是模型输出问题，
+        说明服务本身活着，不该被熔断连带停掉。
+        """
+        self._jev_failure_streak = getattr(self, "_jev_failure_streak", 0) + 1
+        if self._jev_failure_streak >= self.JEV_FAILURE_LIMIT:
+            self._jev_paused_until = asyncio.get_running_loop().time() + (
+                self.JEV_PAUSE_SECONDS
+            )
+            logger.error(
+                f"Jev failed {self._jev_failure_streak} times in a row; "
+                f"pausing for {self.JEV_PAUSE_SECONDS:.0f}s"
+            )
+            self._jev_failure_streak = 0
+
+    def _jev_note_success(self) -> None:
+        """Clear the failure streak: a healthy response proves the service is up."""
+        self._jev_failure_streak = 0
+
     async def _jev_choice(
         self,
         state: dict,
@@ -1218,6 +1351,11 @@ class SoupaiPlugin(Star):
             "threshold": min_confidence,
             "reason": None,
             "extra": {},
+            # 诊断字段：出问题时能分清是模型换了、提示词改了还是网络慢
+            "model": self.jev_model,
+            "prompt_version": self.JEV_PROMPT_VERSION,
+            "latency_ms": None,
+            "attempts": 0,
         }
 
         questions: dict[str, dict] = {
@@ -1236,30 +1374,27 @@ class SoupaiPlugin(Star):
             "state": state,
             "questions": questions,
         }
-        try:
-            if self._jev_client is None:
-                self._jev_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(15.0),
-                    follow_redirects=False,
-                )
-            base_url = self.jev_base_url.removesuffix("/v1")
-            resp = await asyncio.wait_for(
-                self._jev_client.post(
-                    f"{base_url}/v1/systemone",
-                    headers={"Authorization": f"Bearer {self.jev_api_key}"},
-                    json=payload,
-                ),
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            logger.warning(f"Jev request failed: {e}")
-            result["reason"] = "request_failed"
+        resp = await self._jev_post(payload, result)
+        if resp is None:
             return result
+        self._jev_note_success()
 
         answers: dict = {}
         try:
-            answers = resp.json()["answers"]
+            body = resp.json()
+            # 响应会回报它实际用的模型版本（如 jev-1.14.0），这与配置里的
+            # jev-latest 不是一个东西：别名背后换版时，只有这里看得出来。
+            upstream_model = body.get("model")
+            if isinstance(upstream_model, str) and upstream_model.strip():
+                result["model"] = upstream_model.strip()
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                result["usage"] = {
+                    key: value
+                    for key, value in usage.items()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                }
+            answers = body["answers"]
             answer = answers["verdict"]
             if not isinstance(answer, dict) or answer.get("type", "choice") != "choice":
                 raise ValueError("Invalid Jev answer type")
@@ -1629,6 +1764,13 @@ class SoupaiPlugin(Star):
             storage = self._storage_of(source)
             if story_id is not None and storage.find_index(story_id) < 0:
                 raise ValueError("题目不存在或已经删除")
+            moderation = None
+            if self.content_moderation_enabled:
+                moderation = await self.story_catalog.moderate(puzzle, answer, umo)
+                if not moderation["passed"]:
+                    raise ValueError(
+                        f"题目未通过内容审核（{moderation['reason']}），未写入题库"
+                    )
             report = await self.story_catalog.check(
                 puzzle,
                 answer,
@@ -1691,6 +1833,8 @@ class SoupaiPlugin(Star):
                     "题目已保存，但标注缓存写入失败，请稍后重新标注。"
                 )
             saved["check"] = report
+            if moderation is not None:
+                report["moderation"] = moderation
             return saved
 
     async def generate_and_store_story(
@@ -1966,6 +2110,46 @@ class SoupaiPlugin(Star):
         "是也不是": "同一句含多项独立断言且既有真又有假，或同一命题在故事明确给出的不同条件下成立与不成立。仅未讲全故事不属于此类。",
     }
 
+    # 一句话里塞多项独立断言时，快速判定模型会把「最后一项为假」当成整体为假，
+    # 于是本该「是也不是」的题被判成「否」。金标实测：这类题交给大模型后
+    # 准确率由 0.902 升到 0.942，所以识别出来直接路由，不再雕提示词。
+    # 分句后是纯确认尾巴（对吗、是吧）或从属句（因为、所以）不算独立断言，
+    # 否则「他不在家，是因为加班吗」这种单一命题会被误判成复合提问。
+    _COMPOUND_TAIL = re.compile(
+        r"^(?:对|是|好|行|真的|真|可以|没错)?(?:吗|嘛|么|吧|呢)?[？?。!！\s]*$"
+    )
+    _COMPOUND_SUBORDINATE = re.compile(
+        r"^(?:因为|由于|所以|因此|而|但是|可是|不过|却|才|就|是因为|还是说|否则)"
+    )
+
+    @classmethod
+    def _is_compound_question(cls, question: str) -> bool:
+        """判断一句话里是否含多项独立断言，需要交给大模型复核。
+
+        显式并列词不需要逗号就能判出来；其余情况按逗号、分号切分句，
+        要求每一段都是能单独成立的断言。切不出两段、或后续分句只是
+        前面那句的因果/转折补充时，仍算单一命题。
+
+        Args:
+            question: 玩家原话。
+
+        Returns:
+            为真表示该问题应绕过快速判定模型，直接交给大模型。
+        """
+        if re.search(r"而且|并且|以及|同时|既.+又|这[两三几]点|这两件|三件", question):
+            return True
+        parts = [
+            part.strip() for part in re.split(r"[，,；;]", question) if part.strip()
+        ]
+        while len(parts) > 1 and cls._COMPOUND_TAIL.match(parts[-1]):
+            parts.pop()
+        if len(parts) < 2:
+            return False
+        return all(
+            len(part) >= 2 and not cls._COMPOUND_SUBORDINATE.match(part)
+            for part in parts[1:]
+        )
+
     # 贡献度评级。它搭在提问判定的同一次 Jev 请求上（同一份 state、并行评估），
     # 只用来决定结算时分多少奖励：不参与是/否判定，也从不回给玩家——告诉玩家
     # "这问得很关键"等于在免费提示他方向对了。
@@ -2042,12 +2226,7 @@ class SoupaiPlugin(Star):
                 r"^(?:[他她它]|[Tt]hen\b|[Hh]e\b|[Ss]he\b|[Tt]hey\b|[Ii]t\b)", question
             )
         )
-        compound = bool(
-            re.search(
-                r"而且|并且|以及|同时|这[两三几]点|这两件|既.+又|[，,；;].{0,120}(?:也|又)",
-                question,
-            )
-        )
+        compound = self._is_compound_question(question)
         review_reason = (
             "context_required"
             if contextual
@@ -2695,13 +2874,17 @@ class SoupaiPlugin(Star):
                     # 使用 LLM 判断回答（是否问答）
                     logger.info(f"使用 LLM 判断游戏问答: '{command_part}'")
                     player_id = str(event.get_sender_id() or "")
-                    player_history = game.get("_player_qa", {}).get(player_id, [])
+                    # 指代上下文取全队最近的问答，不按玩家分：群聊里大家共享
+                    # 同一段对话，A 刚确认了「主播是女性」，B 接着问「她其实
+                    # 是我吗」，指的是 A 立起来的那个人。按玩家隔离会让这类
+                    # 直问被判成「需要澄清」，而它本来是能答的。
+                    recent_history = (game.get("qa_history") or [])[-3:]
                     reply, judged_by = await self.judge_question(
                         command_part,
                         current_answer,
                         event.unified_msg_origin,
                         game.get("puzzle", "") if game else "",
-                        qa_history=player_history[:],
+                        qa_history=recent_history,
                     )
                     if self.game_state.get_game(group_id) is not session_game:
                         return
@@ -2733,11 +2916,6 @@ class SoupaiPlugin(Star):
                                 ),
                             }
                         )
-                        if player_id:
-                            game.setdefault("_player_qa", {})[player_id] = (
-                                player_history
-                                + [{"question": command_part, "answer": reply}]
-                            )[-3:]
 
                     # 更新问题计数
                     game["question_count"] = game.get("question_count", 0) + 1
@@ -3416,6 +3594,59 @@ class SoupaiPlugin(Star):
             logger.error(f"会话查看历史失败: {e}")
             await event.send(event.plain_result(f"查看历史记录时发生错误：{e}"))
 
+    async def _preset_hint(
+        self, game: dict, hint_count: int, umo: str | None = None
+    ) -> str | None:
+        """Return the pre-written hint for this unlock step, generating once if needed.
+
+        提示按「题库 + 题目 ID」缓存，并随题目内容变化失效。对局本身只存
+        题面与汤底，所以这里按这两项反查——去重保证了这个组合在题库里唯一。
+        第一次要提示时一次调用生成全部 2-3 条，后续各次直接读缓存。
+
+        Args:
+            game: Active game state holding the puzzle and answer.
+            hint_count: How many hints have been used, i.e. the next unlock index.
+            umo: Session origin for provider resolution.
+
+        Returns:
+            One hint, or None when no preset set exists and the caller should
+            fall back to dynamic generation.
+        """
+        puzzle, answer = game.get("puzzle"), game.get("answer")
+        if not isinstance(puzzle, str) or not isinstance(answer, str):
+            return None
+        # 预置提示是锦上添花：题库扫描或生成出任何问题都只是退回动态提示，
+        # 不能让玩家这局要不到提示。
+        try:
+            entry = next(
+                (
+                    item
+                    for item in self.story_catalog.entries()
+                    if item["puzzle"] == puzzle and item["answer"] == answer
+                ),
+                None,
+            )
+            if entry is None:
+                return None
+            hints = self.story_catalog.hints_for(
+                entry["source"], entry["id"], puzzle, answer
+            )
+            if hints is None:
+                hints = await self.story_catalog.generate_hints(puzzle, answer, umo)
+                try:
+                    self.story_catalog.remember_hints(
+                        entry["source"], entry["id"], puzzle, answer, hints
+                    )
+                except ValueError as exc:
+                    # 缓存写不进去不等于这次没有提示：这一局照用，下次再存
+                    logger.warning(f"Preset hints generated but not cached: {exc}")
+        except Exception as exc:
+            logger.info(f"Preset hints unavailable, using dynamic hint: {exc}")
+            return None
+        if hint_count < len(hints):
+            return hints[hint_count]
+        return None
+
     async def _build_hint_result(
         self, event: AstrMessageEvent, group_id: str
     ) -> MessageEventResult | None:
@@ -3439,16 +3670,20 @@ class SoupaiPlugin(Star):
             return event.plain_result("请先进行提问后再请求提示")
 
         hint_history = game.get("hint_history", [])
-        allow_list = self.build_allow_list(game["puzzle"], qa_history)
-
-        hint = await self.generate_hint(
-            game["puzzle"],
-            game["answer"],
-            qa_history,
-            hint_history,
-            allow_list,
-            event.unified_msg_origin,
-        )
+        # 预置提示优先：第一次要提示时一次生成全部，之后每局都是零调用。
+        # 内容在解锁时定下、可人工过目，比每次现生成更可控；拿不到缓存
+        # （生成失败、题目已编辑）才回退到按当前问答动态生成。
+        hint = await self._preset_hint(game, hint_count, event.unified_msg_origin)
+        if hint is None:
+            allow_list = self.build_allow_list(game["puzzle"], qa_history)
+            hint = await self.generate_hint(
+                game["puzzle"],
+                game["answer"],
+                qa_history,
+                hint_history,
+                allow_list,
+                event.unified_msg_origin,
+            )
         if self.game_state.get_game(group_id) is not game:
             return None
         game["hint_count"] = hint_count + 1

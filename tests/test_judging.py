@@ -129,14 +129,22 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         self.response_status = 200
         self.request_error = None
         self.requests = []
+        # 每次请求依次取一个状态码，取完后沿用 response_status。
+        # 空列表表示不干预，正常返回。
+        self.request_statuses: list[int] = []
 
         def handle_request(request):
             self.requests.append(request)
             if self.request_error:
                 raise self.request_error
+            status = (
+                self.request_statuses.pop(0)
+                if self.request_statuses
+                else self.response_status
+            )
             # Raw JSON also lets the tests exercise invalid NaN/Infinity values.
             return httpx.Response(
-                self.response_status,
+                status,
                 content=json.dumps(self.response_data),
                 headers={"Content-Type": "application/json"},
             )
@@ -541,6 +549,30 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(source["engine"], "jev")
 
+    async def test_comma_joined_independent_claims_route_to_the_llm(self):
+        """金标实测：这类句子被快速模型当成整体为假，改路由后准确率 0.902→0.942。"""
+        judge = self.plugin._is_compound_question
+        for question in (
+            "妈妈得了心脏病，孩子的生日在十月吗？",
+            "凶手是小偷，哥哥看到了他吗？",
+            "丈夫买了两张船票，都是往返票吗？",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(judge(question))
+
+    async def test_single_propositions_stay_on_the_fast_path(self):
+        """纯确认尾巴和因果从属句都不构成第二项断言，不能被误路由。"""
+        judge = self.plugin._is_compound_question
+        for question in (
+            "他并不是没有坐电梯，对吗？",
+            "你当时不在阳台上吗？",
+            "妈妈教孩子错的数数，是因为她自己不识数吗？",
+            "你每天醒来都会忘记一切，是因为你给自己设定了清空记忆吗？",
+            "他不在家吗？",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(judge(question))
+
     async def test_disabled_or_unavailable_review_asks_to_split_instead_of_guessing(
         self,
     ):
@@ -635,6 +667,30 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.judge_question("Check?", "Story")
         self.judge_provider.text_chat.assert_not_awaited()
 
+    async def test_upstream_model_version_and_usage_are_recorded(self):
+        """配置里写的是别名（jev-latest），真实版本只有响应能告诉我们。"""
+        self.response_data = {
+            "model": "jev-1.14.0",
+            "answers": {"verdict": self.answer},
+            "usage": {"input_tokens": 543, "output_tokens": 51},
+        }
+
+        _, source = await self.plugin.judge_question("Check?", "Story")
+
+        self.assertEqual(source["jev"]["model"], "jev-1.14.0")
+        self.assertEqual(
+            source["jev"]["usage"], {"input_tokens": 543, "output_tokens": 51}
+        )
+
+    async def test_missing_usage_does_not_invent_numbers(self):
+        self.response_data = {"answers": {"verdict": self.answer}}
+
+        _, source = await self.plugin.judge_question("Check?", "Story")
+
+        self.assertNotIn("usage", source["jev"])
+        # 没有 model 字段时保留配置里的名字，而不是留空
+        self.assertEqual(source["jev"]["model"], "jev-test")
+
     async def test_total_request_timeouts_cancel_pending_operations(self):
         real_wait_for = asyncio.wait_for
         limits = []
@@ -653,11 +709,50 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
             reply, source = await self.plugin.judge_question("Check?", "Story")
             self.assertEqual(reply, "否")
             self.assertEqual(source["jev"]["reason"], "request_failed")
-            self.assertEqual(limits, [15.0, 60.0])
+            # 一次失败后按总期限重试一次：两次尝试各 20 秒，再落到 LLM 的 60 秒
+            self.assertEqual(len(limits), 3)
+            self.assertEqual(limits[0], self.plugin.JEV_ATTEMPT_TIMEOUT)
+            self.assertLessEqual(limits[1], self.plugin.JEV_ATTEMPT_TIMEOUT)
+            self.assertEqual(limits[2], 60.0)
+            self.assertEqual(source["jev"]["attempts"], 2)
             self.plugin.judge_engine = "llm"
             self.judge_provider.text_chat.side_effect = pending
             _, source = await self.plugin.judge_question("Check?", "Story")
             self.assertEqual(source["engine"], "unavailable")
+
+    async def test_transient_failure_is_retried_once_and_then_succeeds(self):
+        """上游 5xx 属于可重试错误：一次重试就该拿回判定，而不是直接回退。"""
+        self.request_statuses = [503, 200]
+        self.requests.clear()
+        reply, source = await self.plugin.judge_question("Check?", "Story")
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(reply, "是")
+        self.assertEqual(source["engine"], "jev")
+        self.assertEqual(source["jev"]["attempts"], 2)
+        self.assertEqual(source["jev"]["model"], "jev-test")
+        self.assertEqual(
+            source["jev"]["prompt_version"], self.plugin.JEV_PROMPT_VERSION
+        )
+
+    async def test_auth_failure_is_not_retried(self):
+        """密钥或权限错了，重试只会更快打光配额，必须立即放弃。"""
+        self.request_statuses = [401]
+        self.requests.clear()
+        _, source = await self.plugin.judge_question("Check?", "Story")
+
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(source["jev"]["reason"], "request_failed")
+
+    async def test_repeated_failures_pause_jev_instead_of_hammering_it(self):
+        self.plugin._jev_failure_streak = 0
+        self.plugin._jev_paused_until = 0.0
+        for _ in range(self.plugin.JEV_FAILURE_LIMIT):
+            self.plugin._jev_note_failure()
+        self.assertGreater(self.plugin._jev_paused_until, 0.0)
+        self.assertEqual(self.plugin._jev_failure_streak, 0)
+        self.plugin._jev_note_success()
+        self.assertEqual(self.plugin._jev_failure_streak, 0)
 
     async def test_config_changes_reuse_pool_and_apply_current_credentials(self):
         await self.plugin.judge_question("First?", "Story")
@@ -757,6 +852,100 @@ class JudgingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin.context.get_provider_by_id.assert_not_called()
         self.default_provider.text_chat.assert_awaited_once()
+
+    async def test_preset_hint_is_used_before_generating_one(self):
+        self.plugin.story_catalog = SimpleNamespace(
+            entries=Mock(
+                return_value=[
+                    {
+                        "source": "network",
+                        "id": "abc",
+                        "puzzle": "Test puzzle",
+                        "answer": "Test answer",
+                    }
+                ]
+            ),
+            hints_for=Mock(
+                return_value=["关注【地点】：确认照明", "关注【动机】：谁需要黑暗"]
+            ),
+            generate_hints=AsyncMock(),
+            remember_hints=Mock(),
+        )
+
+        game = {"puzzle": "Test puzzle", "answer": "Test answer"}
+
+        self.assertEqual(
+            await self.plugin._preset_hint(game, 0), "关注【地点】：确认照明"
+        )
+        self.assertEqual(
+            await self.plugin._preset_hint(game, 1), "关注【动机】：谁需要黑暗"
+        )
+        # 预置集合用完之后交给动态生成，而不是重复最后一条
+        self.assertIsNone(await self.plugin._preset_hint(game, 2))
+        self.plugin.story_catalog.generate_hints.assert_not_awaited()
+
+    async def test_preset_hint_is_generated_once_when_missing(self):
+        self.plugin.story_catalog = SimpleNamespace(
+            entries=Mock(
+                return_value=[
+                    {
+                        "source": "local",
+                        "id": "xyz",
+                        "puzzle": "Test puzzle",
+                        "answer": "Test answer",
+                    }
+                ]
+            ),
+            hints_for=Mock(return_value=None),
+            generate_hints=AsyncMock(return_value=["关注【关系】：梳理人物"]),
+            remember_hints=Mock(),
+        )
+
+        hint = await self.plugin._preset_hint(
+            {"puzzle": "Test puzzle", "answer": "Test answer"}, 0, "test-session"
+        )
+
+        self.assertEqual(hint, "关注【关系】：梳理人物")
+        self.plugin.story_catalog.generate_hints.assert_awaited_once_with(
+            "Test puzzle", "Test answer", "test-session"
+        )
+        self.plugin.story_catalog.remember_hints.assert_called_once_with(
+            "local", "xyz", "Test puzzle", "Test answer", ["关注【关系】：梳理人物"]
+        )
+
+    async def test_a_hint_is_still_served_when_the_cache_write_fails(self):
+        self.plugin.story_catalog = SimpleNamespace(
+            entries=Mock(
+                return_value=[
+                    {
+                        "source": "local",
+                        "id": "xyz",
+                        "puzzle": "Test puzzle",
+                        "answer": "Test answer",
+                    }
+                ]
+            ),
+            hints_for=Mock(return_value=None),
+            generate_hints=AsyncMock(return_value=["关注【关系】：梳理人物"]),
+            remember_hints=Mock(side_effect=ValueError("disk full")),
+        )
+
+        hint = await self.plugin._preset_hint(
+            {"puzzle": "Test puzzle", "answer": "Test answer"}, 0
+        )
+
+        self.assertEqual(hint, "关注【关系】：梳理人物")
+
+    async def test_a_broken_catalog_falls_back_instead_of_breaking_hints(self):
+        self.plugin.story_catalog = SimpleNamespace(
+            entries=Mock(side_effect=RuntimeError("catalog exploded"))
+        )
+
+        hint = await self.plugin._preset_hint(
+            {"puzzle": "Test puzzle", "answer": "Test answer"}, 0
+        )
+
+        self.assertIsNone(hint)
 
     async def test_missing_verify_configuration_follows_judge_provider(self):
         del self.plugin.config["verify_llm_provider"]
